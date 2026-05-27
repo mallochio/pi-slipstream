@@ -1,0 +1,1020 @@
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	SessionBeforeCompactEvent,
+	TurnEndEvent,
+} from "@mariozechner/pi-coding-agent";
+import {
+	finalizeAutoJob,
+	isAutoTriggerBoundary,
+	shouldActivatePreparedCompaction,
+	shouldStartAutoJob,
+	shouldTriggerPreparedCompactionNow,
+	startAutoJob,
+} from "./auto.ts";
+import type { FinalizeAutoJobInput } from "./auto.ts";
+import { buildContinuationFromBranch } from "./continuation.ts";
+import { loadSettings } from "./config.ts";
+import {
+	acceptRejectedSummaryByPolicy,
+	clearPendingArtifact,
+	handleSlipstreamCommand,
+	persistPendingArtifact,
+	recoverPendingArtifact,
+	resolveArtifactRoot,
+} from "./commands.ts";
+import {
+	runValidatedSlipstream,
+	type ValidatedRunInput,
+	type ValidatedRunResult,
+} from "./pipeline.ts";
+import { createJudgeCompleter, createSummaryCompleter } from "./model.ts";
+import {
+	consumePendingForCompaction,
+	createRuntimeState,
+	storePendingValidated,
+} from "./session-state.ts";
+import type { ProgressEvent, ProgressSink, RuntimeState } from "./types.ts";
+import type { SlipstreamConfig } from "./config.ts";
+import {
+	clearSlipstreamWidget,
+	formatElapsed,
+	updateSlipstreamWidget,
+} from "./ui.ts";
+import type { SessionEntry } from "./types.ts";
+
+type SlipstreamContext = {
+	cwd: string;
+	model?: { provider: string; id: string };
+	modelRegistry?: {
+		find(
+			provider: string,
+			id: string,
+		): { provider: string; id: string } | undefined;
+		getApiKeyAndHeaders(model: { provider: string; id: string }): Promise<{
+			ok?: boolean;
+			error?: string;
+			apiKey?: string;
+			headers?: Record<string, string>;
+		}>;
+	};
+	ui?: {
+		notify(message: string, type?: "info" | "warning" | "error"): void;
+		setStatus?(key: string, text: string | undefined): void;
+		setWidget?(
+			key: string,
+			lines: string[] | undefined,
+			options?: { placement?: "aboveEditor" | "belowEditor" },
+		): void;
+		confirm?(
+			title: string,
+			message: string,
+			options?: { timeout?: number; signal?: AbortSignal },
+		): boolean | Promise<boolean>;
+	};
+	sessionManager: { getSessionId?(): string; getBranch(): SessionEntry[] };
+	getContextUsage?():
+		| { tokens: number | null; percent?: number | null; contextWindow?: number }
+		| undefined;
+	signal?: AbortSignal;
+	compact?(options?: {
+		customInstructions?: string;
+		onComplete?: (result: unknown) => void;
+		onError?: (error: Error) => void;
+	}): void;
+	isIdle?: () => boolean;
+	hasPendingMessages?: () => boolean;
+};
+
+type PiContext = ExtensionContext | ExtensionCommandContext | SlipstreamContext;
+type LocalSessionEntry = SessionEntry;
+type RunValidatedSlipstream = (
+	input: ValidatedRunInput,
+) => Promise<ValidatedRunResult>;
+type LocalCompactEvent = Partial<
+	Omit<SessionBeforeCompactEvent, "preparation" | "branchEntries">
+> & {
+	preparation: { firstKeptEntryId: string; tokensBefore: number };
+	branchEntries?: LocalSessionEntry[];
+};
+type HookCompactionResult = {
+	compaction?: {
+		summary: string;
+		firstKeptEntryId: string;
+		tokensBefore: number;
+		details: Record<string, unknown>;
+	};
+	cancel?: boolean;
+};
+
+type DefaultCompactionDeps = {
+	createSummaryCompleter?: typeof createSummaryCompleter;
+	createJudgeCompleter?: typeof createJudgeCompleter;
+};
+
+function ignoreStaleContextError(error: unknown): void {
+	if (
+		error instanceof Error &&
+		error.message.includes("extension ctx is stale")
+	)
+		return;
+	throw error;
+}
+
+function safeNotify(
+	ctx: PiContext,
+	message: string,
+	type: "info" | "warning" | "error" = "info",
+): void {
+	try {
+		ctx.ui?.notify(message, type);
+	} catch (error) {
+		ignoreStaleContextError(error);
+	}
+}
+
+function yieldForUiPaint(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+function progressStep(phase: ProgressEvent["phase"]): string {
+	switch (phase) {
+		case "snapshot":
+			return "1/5 snapshot";
+		case "artifacts":
+			return "2/5 artifacts";
+		case "state-evidence":
+			return "3/5 state";
+		case "summary":
+			return "4/5 summary";
+		case "finalizing-summary":
+			return "4/5 waiting";
+		case "judging":
+			return "5/5 judge";
+		case "repairing":
+			return "repair";
+		case "accepted":
+			return "accepted";
+		case "rejected":
+			return "rejected";
+	}
+}
+
+function persistentStatusText(state: RuntimeState): string {
+	if (state.status === "ready_to_adopt") return "slipstream: pending";
+	if (state.status === "awaiting_continuation")
+		return "slipstream: auto awaiting continuation";
+	if (state.status === "summarizing") return "slipstream: compacting";
+	if (state.status === "finalizing_summary")
+		return "slipstream: waiting for auto summary";
+	if (state.status === "judging" || state.status === "repairing")
+		return `slipstream: ${state.status}`;
+	return "slipstream: manual";
+}
+
+function restorePersistentStatus(
+	ctx: PiContext,
+	state: RuntimeState,
+	config: SlipstreamConfig,
+): void {
+	try {
+		ctx.ui?.setStatus?.("slipstream", persistentStatusText(state));
+	} catch (error) {
+		ignoreStaleContextError(error);
+	}
+	updateSlipstreamWidget(ctx, state, config);
+}
+
+type ManagedProgressSink = ProgressSink & { clear(): void };
+
+function makeProgressSink(
+	ctx: PiContext,
+	mode: "auto" | "compact",
+	state: RuntimeState,
+	config: SlipstreamConfig,
+): ManagedProgressSink {
+	let current: ProgressEvent | null = null;
+	let phaseStartedAt = Date.now();
+	let timer: ReturnType<typeof setInterval> | null = null;
+	const clear = (): void => {
+		if (timer) clearInterval(timer);
+		timer = null;
+		current = null;
+		clearSlipstreamWidget(ctx);
+	};
+	const render = (): void => {
+		if (!current) return;
+		const event = { ...current, elapsedMs: Date.now() - phaseStartedAt };
+		const message = `slipstream: ${mode} ${progressStep(event.phase)} (${formatElapsed(event.elapsedMs)}) — ${event.message}`;
+		try {
+			ctx.ui?.setStatus?.("slipstream", message);
+			updateSlipstreamWidget(ctx, state, config, { progress: event });
+		} catch (error) {
+			ignoreStaleContextError(error);
+		}
+		if (mode === "auto" && current.phase === "summary" && !state.activePromise)
+			clear();
+	};
+	const sink = ((event: ProgressEvent): void => {
+		if (!current || current.phase !== event.phase) phaseStartedAt = Date.now();
+		current = event;
+		render();
+		if (event.phase === "accepted" || event.phase === "rejected") {
+			clear();
+			return;
+		}
+		if (!timer) timer = setInterval(render, 1_000);
+	}) as ManagedProgressSink;
+	sink.clear = clear;
+	return sink;
+}
+
+export async function buildDefaultSlipstreamCompaction(
+	event: LocalCompactEvent,
+	ctx: PiContext,
+	config: SlipstreamConfig,
+	state: RuntimeState,
+	onProgress: (event: ProgressEvent) => void,
+	deps: DefaultCompactionDeps = {},
+): Promise<HookCompactionResult | undefined> {
+	if (!config.enabled) return undefined;
+	if (!ctx.modelRegistry) {
+		safeNotify(
+			ctx,
+			"Slipstream default compaction cancelled: no model registry is available.",
+			"error",
+		);
+		return { cancel: true };
+	}
+	const branchEntries = (event.branchEntries ??
+		ctx.sessionManager.getBranch()) as unknown as LocalSessionEntry[];
+	const sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+	const cwd = ctx.cwd;
+	const contextUsage = ctx.getContextUsage?.();
+	const continuation = buildContinuationFromBranch(
+		branchEntries,
+		config.maxContinuationTurns,
+	);
+	if (continuation.turns.length < config.minContinuationTurns) {
+		state.status = "rejected";
+		safeNotify(
+			ctx,
+			`Slipstream default compaction cancelled: need at least ${config.minContinuationTurns} continuation turn(s), found ${continuation.turns.length}.`,
+			"warning",
+		);
+		return { cancel: true };
+	}
+	const makeSummaryCompleter =
+		deps.createSummaryCompleter ?? createSummaryCompleter;
+	const makeJudgeCompleter = deps.createJudgeCompleter ?? createJudgeCompleter;
+	const result = await runValidatedSlipstream({
+		branchEntries,
+		sessionId,
+		cwd,
+		artifactRoot: await resolveArtifactRoot(cwd, config.artifactRoot),
+		firstKeptEntryId: event.preparation.firstKeptEntryId,
+		tokensBefore: event.preparation.tokensBefore,
+		contextUsage,
+		continuation,
+		statsFullPaths: config.statsFullPaths,
+		completeSummary: makeSummaryCompleter(
+			{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+			config.summaryModel,
+		),
+		completeJudge: makeJudgeCompleter(
+			{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+			config.judgeModel,
+		),
+		judgeThreshold: config.judgeThreshold,
+		repairAttempts: config.repairAttempts,
+		onProgress,
+		signal: event.signal ?? ctx.signal,
+	});
+	state.lastArtifactDir = result.artifactDir;
+	state.lastJudge = result.judge;
+	const rejectedAcceptance =
+		!result.accepted && result.firstKeptEntryId
+			? await acceptRejectedSummaryByPolicy(
+					ctx,
+					result,
+					config.rejectedSummaryMode,
+				)
+			: null;
+	if (
+		(!result.accepted && !rejectedAcceptance?.accepted) ||
+		!result.firstKeptEntryId
+	) {
+		state.status = "rejected";
+		safeNotify(
+			ctx,
+			`Slipstream default compaction could not produce a compaction summary. Score ${result.judge.score}. ${result.judge.diagnosis || "score " + result.judge.score}. Artifacts: ${result.artifactDir}`,
+			"warning",
+		);
+		return { cancel: true };
+	}
+	state.status = "idle";
+	return {
+		compaction: {
+			summary: result.summary,
+			firstKeptEntryId: result.firstKeptEntryId,
+			tokensBefore: event.preparation.tokensBefore,
+			details: {
+				judge: result.judge,
+				artifacts: [result.artifactDir],
+				repaired: result.repaired,
+				manualOverride: rejectedAcceptance?.confirmed ?? false,
+				rejectedSummaryAccepted: !result.accepted,
+				rejectedSummaryMode: rejectedAcceptance?.mode,
+				strategy: "direct",
+				defaultReplacement: true,
+			},
+		},
+	};
+}
+
+export function runtimeReadiness(ctx: PiContext): {
+	isIdle?: () => boolean;
+	hasPendingMessages?: () => boolean;
+} {
+	const readiness: {
+		isIdle?: () => boolean;
+		hasPendingMessages?: () => boolean;
+	} = {};
+	try {
+		const isIdle = ctx.isIdle;
+		if (typeof isIdle === "function") readiness.isIdle = () => isIdle.call(ctx);
+		const hasPendingMessages = ctx.hasPendingMessages;
+		if (typeof hasPendingMessages === "function") {
+			readiness.hasPendingMessages = () => hasPendingMessages.call(ctx);
+		}
+	} catch (error) {
+		ignoreStaleContextError(error);
+	}
+	return readiness;
+}
+
+function isIncompleteAssistantTurn(event: TurnEndEvent): boolean {
+	const message = event.message as { stopReason?: unknown };
+	return message.stopReason === "error" || message.stopReason === "aborted";
+}
+
+function triggerPreparedCompaction(
+	ctx: PiContext,
+	state: RuntimeState,
+	config: SlipstreamConfig,
+): void {
+	try {
+		if (!ctx.compact) return;
+		state.status = "summarizing";
+		ctx.ui?.setStatus?.("slipstream", "slipstream: adopting");
+		updateSlipstreamWidget(ctx, state, config);
+		ctx.compact({
+			customInstructions:
+				"Use validated Slipstream summary from pi-slipstream-compact",
+			onComplete: () => {
+				state.status = "idle";
+				restorePersistentStatus(ctx, state, config);
+			},
+			onError: () => {
+				state.status = state.pending ? "ready_to_adopt" : "idle";
+				restorePersistentStatus(ctx, state, config);
+			},
+		});
+	} catch (error) {
+		state.status = state.pending ? "ready_to_adopt" : "idle";
+		ignoreStaleContextError(error);
+	}
+}
+
+function branchEntries(ctx: PiContext): LocalSessionEntry[] {
+	return ctx.sessionManager.getBranch() as unknown as LocalSessionEntry[];
+}
+
+function currentValidatedThroughEntryId(
+	ctx: PiContext,
+	config: SlipstreamConfig,
+): string | null {
+	return buildContinuationFromBranch(
+		branchEntries(ctx),
+		config.maxContinuationTurns,
+	).triggerEntryId;
+}
+
+function safeBranchEntries(ctx: PiContext): LocalSessionEntry[] | null {
+	try {
+		return branchEntries(ctx);
+	} catch (error) {
+		ignoreStaleContextError(error);
+		return null;
+	}
+}
+
+function validatedThroughEntryIdFromBranch(
+	entries: LocalSessionEntry[],
+	config: SlipstreamConfig,
+): string | null {
+	return buildContinuationFromBranch(entries, config.maxContinuationTurns)
+		.triggerEntryId;
+}
+
+async function revalidatePendingForCurrentHead(
+	ctx: PiContext,
+	config: SlipstreamConfig,
+	state: RuntimeState,
+	sessionId: string,
+	cwd: string,
+	onProgress: (event: ProgressEvent) => void,
+	runValidated: RunValidatedSlipstream,
+): Promise<boolean> {
+	const stalePending = state.pending;
+	if (!stalePending || state.status !== "ready_to_adopt") return false;
+	if (stalePending.sessionId !== sessionId || stalePending.cwd !== cwd)
+		return false;
+	if (!ctx.modelRegistry) return false;
+	const branch = safeBranchEntries(ctx);
+	if (!branch) return false;
+	const continuation = buildContinuationFromBranch(
+		branch,
+		config.maxContinuationTurns,
+	);
+	if (
+		continuation.triggerEntryId === null ||
+		stalePending.validatedThroughEntryId === continuation.triggerEntryId ||
+		continuation.turns.length < config.minContinuationTurns
+	)
+		return false;
+	try {
+		ctx.ui?.setStatus?.("slipstream", "slipstream: reconciling");
+	} catch (error) {
+		ignoreStaleContextError(error);
+	}
+	const contextUsage = ctx.getContextUsage?.();
+	const artifactRoot = await resolveArtifactRoot(cwd, config.artifactRoot);
+	const result = await runValidated({
+		branchEntries: branch,
+		sessionId,
+		cwd,
+		artifactRoot,
+		keepRecentTokens: config.slipstreamKeepRecentTokens,
+		tokensBefore: contextUsage?.tokens ?? stalePending.tokensBefore,
+		contextUsage,
+		continuation,
+		statsFullPaths: config.statsFullPaths,
+		completeSummary: createSummaryCompleter(
+			{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+			config.summaryModel,
+		),
+		completeJudge: createJudgeCompleter(
+			{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+			config.judgeModel,
+		),
+		judgeThreshold: config.judgeThreshold,
+		repairAttempts: config.repairAttempts,
+		onProgress,
+		signal: ctx.signal,
+	});
+	if (state.pending !== stalePending || state.status !== "ready_to_adopt")
+		return false;
+	state.lastArtifactDir = result.artifactDir;
+	state.lastJudge = result.judge;
+	if (
+		!result.firstKeptEntryId ||
+		(!result.accepted && config.rejectedSummaryMode === "reject")
+	) {
+		state.pending = null;
+		state.status = "rejected";
+		return false;
+	}
+	const pending = {
+		sessionId,
+		cwd,
+		projectId: cwd,
+		summary: result.summary,
+		firstKeptEntryId: result.firstKeptEntryId,
+		validatedThroughEntryId: continuation.triggerEntryId,
+		tokensBefore: result.tokensBefore ?? stalePending.tokensBefore,
+		details: {
+			judge: result.judge,
+			artifacts: [result.artifactDir],
+			repaired: result.repaired,
+			auto: true,
+			rejectedSummaryAccepted: !result.accepted,
+			rejectedSummaryMode: config.rejectedSummaryMode,
+			revalidatedFromEntryId: stalePending.validatedThroughEntryId,
+		},
+		expiresAt: Date.now() + config.pendingTtlMs,
+	};
+	await persistPendingArtifact(result.artifactDir, pending);
+	if (state.pending !== stalePending || state.status !== "ready_to_adopt")
+		return false;
+	storePendingValidated(state, pending);
+	return true;
+}
+
+export function registerLifecycle(
+	pi: ExtensionAPI,
+	config: SlipstreamConfig,
+	state: RuntimeState,
+	deps: {
+		finalizeAutoJob?: (input: FinalizeAutoJobInput) => Promise<boolean>;
+		buildDefaultSlipstreamCompaction?: typeof buildDefaultSlipstreamCompaction;
+		runValidatedSlipstream?: RunValidatedSlipstream;
+	} = {},
+): void {
+	const finalizeAuto = deps.finalizeAutoJob ?? finalizeAutoJob;
+	const buildDefaultCompaction =
+		deps.buildDefaultSlipstreamCompaction ?? buildDefaultSlipstreamCompaction;
+	const runValidated = deps.runValidatedSlipstream ?? runValidatedSlipstream;
+	let deferredIdleRetry: ReturnType<typeof setTimeout> | null = null;
+	let turnBoundaryWorkScheduled = false;
+	let queuedTurnBoundaryWork: {
+		event: TurnEndEvent;
+		ctx: PiContext;
+		canAdoptAtTurnBoundary: boolean;
+	} | null = null;
+	const clearDeferredIdleRetry = (): void => {
+		if (deferredIdleRetry === null) return;
+		clearTimeout(deferredIdleRetry);
+		deferredIdleRetry = null;
+	};
+	const scheduleDeferredIdleRetry = (ctx: PiContext): void => {
+		if (deferredIdleRetry !== null) return;
+		let sessionId = "unknown";
+		let cwd = ".";
+		try {
+			sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+			cwd = ctx.cwd;
+		} catch (error) {
+			ignoreStaleContextError(error);
+			return;
+		}
+		deferredIdleRetry = setTimeout(() => {
+			try {
+				deferredIdleRetry = null;
+				if (ctx.sessionManager.getSessionId?.() !== sessionId) return;
+				if (ctx.cwd !== cwd) return;
+				void tryAdoptAtSafeBoundary(ctx, { allowDeferredRetry: false }).catch(
+					ignoreStaleContextError,
+				);
+			} catch (error) {
+				ignoreStaleContextError(error);
+			}
+		}, 0);
+		deferredIdleRetry.unref?.();
+	};
+	const startAutoAtStableBoundary = async (ctx: PiContext): Promise<void> => {
+		let sessionId = "unknown";
+		let cwd = ".";
+		try {
+			sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+			cwd = ctx.cwd;
+		} catch (error) {
+			ignoreStaleContextError(error);
+			return;
+		}
+		const branch = safeBranchEntries(ctx);
+		if (!branch) return;
+		if (
+			!ctx.modelRegistry ||
+			!shouldStartAutoJob(config, state, ctx.getContextUsage?.(), {
+				sessionId,
+				cwd,
+				now: Date.now(),
+				validatedThroughEntryId: validatedThroughEntryIdFromBranch(
+					branch,
+					config,
+				),
+			})
+		)
+			return;
+		const progress = makeProgressSink(ctx, "auto", state, config);
+		try {
+			await startAutoJob({
+				state,
+				config,
+				branchEntries: branch,
+				sessionId,
+				cwd,
+				artifactRoot: await resolveArtifactRoot(cwd, config.artifactRoot),
+				completeSummary: createSummaryCompleter(
+					{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+					config.summaryModel,
+				),
+				tokensBefore: ctx.getContextUsage?.()?.tokens ?? null,
+				contextUsage: ctx.getContextUsage?.(),
+				onProgress: progress,
+				signal: ctx.signal,
+				isCurrent: () => {
+					try {
+						const currentBranch = safeBranchEntries(ctx);
+						return (
+							currentBranch !== null &&
+							validatedThroughEntryIdFromBranch(currentBranch, config) ===
+								validatedThroughEntryIdFromBranch(branch, config) &&
+							ctx.sessionManager.getSessionId?.() === sessionId &&
+							ctx.cwd === cwd &&
+							state.compactionWanted &&
+							!state.pending &&
+							!state.autoJob &&
+							!state.activePromise
+						);
+					} catch (error) {
+						ignoreStaleContextError(error);
+						return false;
+					}
+				},
+			});
+		} finally {
+			const activeSummary = state.activePromise;
+			if (activeSummary) {
+				void activeSummary.then(
+					() => {
+						progress.clear();
+						restorePersistentStatus(ctx, state, config);
+					},
+					() => {
+						progress.clear();
+						restorePersistentStatus(ctx, state, config);
+					},
+				);
+			} else {
+				progress.clear();
+				restorePersistentStatus(ctx, state, config);
+			}
+		}
+	};
+	const tryAdoptAtSafeBoundary = async (
+		ctx: PiContext,
+		options: { allowDeferredRetry?: boolean } = {},
+	): Promise<boolean> => {
+		let sessionId = "unknown";
+		let cwd = ".";
+		try {
+			sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+			cwd = ctx.cwd;
+		} catch (error) {
+			ignoreStaleContextError(error);
+			return false;
+		}
+		if (!shouldTriggerPreparedCompactionNow(runtimeReadiness(ctx))) {
+			if (
+				options.allowDeferredRetry !== false &&
+				state.pending &&
+				state.status === "ready_to_adopt"
+			)
+				scheduleDeferredIdleRetry(ctx);
+			return false;
+		}
+		const branch = safeBranchEntries(ctx);
+		if (!branch) return false;
+		const validatedThroughEntryId = validatedThroughEntryIdFromBranch(
+			branch,
+			config,
+		);
+		if (
+			shouldActivatePreparedCompaction(config, state, ctx.getContextUsage?.(), {
+				sessionId,
+				cwd,
+				now: Date.now(),
+				validatedThroughEntryId,
+			})
+		) {
+			clearDeferredIdleRetry();
+			triggerPreparedCompaction(ctx, state, config);
+			return true;
+		}
+		if (state.pending && state.status === "ready_to_adopt") {
+			const progress = makeProgressSink(ctx, "auto", state, config);
+			let reconciled: boolean;
+			try {
+				reconciled = await revalidatePendingForCurrentHead(
+					ctx,
+					config,
+					state,
+					sessionId,
+					cwd,
+					progress,
+					runValidated,
+				);
+			} finally {
+				progress.clear();
+			}
+			if (reconciled) {
+				const revalidatedBranch = safeBranchEntries(ctx);
+				if (!revalidatedBranch) return false;
+				if (
+					shouldActivatePreparedCompaction(
+						config,
+						state,
+						ctx.getContextUsage?.(),
+						{
+							sessionId,
+							cwd,
+							now: Date.now(),
+							validatedThroughEntryId: validatedThroughEntryIdFromBranch(
+								revalidatedBranch,
+								config,
+							),
+						},
+					)
+				) {
+					clearDeferredIdleRetry();
+					triggerPreparedCompaction(ctx, state, config);
+					return true;
+				}
+			}
+		}
+		restorePersistentStatus(ctx, state, config);
+		return false;
+	};
+	const scheduleTurnBoundaryWork = (
+		event: TurnEndEvent,
+		ctx: PiContext,
+		canAdoptAtTurnBoundary: boolean,
+	): void => {
+		if (turnBoundaryWorkScheduled) {
+			queuedTurnBoundaryWork = { event, ctx, canAdoptAtTurnBoundary };
+			return;
+		}
+		turnBoundaryWorkScheduled = true;
+		void (async () => {
+			try {
+				const adoptionRequested = canAdoptAtTurnBoundary
+					? await tryAdoptAtSafeBoundary(ctx)
+					: false;
+				if (adoptionRequested || state.status === "summarizing") return;
+				if (!isAutoTriggerBoundary(event.message)) return;
+				await startAutoAtStableBoundary(ctx);
+			} catch (error) {
+				try {
+					ignoreStaleContextError(error);
+				} catch (nonStaleError) {
+					state.status = "failed";
+					restorePersistentStatus(ctx, state, config);
+					const message =
+						nonStaleError instanceof Error
+							? nonStaleError.message
+							: String(nonStaleError);
+					safeNotify(
+						ctx,
+						`Slipstream auto boundary work failed; compaction cancelled: ${message}`,
+						"error",
+					);
+				}
+			} finally {
+				turnBoundaryWorkScheduled = false;
+				const queued = queuedTurnBoundaryWork;
+				queuedTurnBoundaryWork = null;
+				if (queued)
+					scheduleTurnBoundaryWork(
+						queued.event,
+						queued.ctx,
+						queued.canAdoptAtTurnBoundary,
+					);
+			}
+		})();
+	};
+
+	pi.on("session_start", async (_event, rawCtx) => {
+		const ctx = rawCtx as PiContext;
+		try {
+			ctx.ui?.setStatus?.(
+				"slipstream",
+				config.enabled ? "slipstream: manual" : undefined,
+			);
+			if (config.enabled) {
+				updateSlipstreamWidget(ctx, state, config);
+				await yieldForUiPaint();
+				const sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+				const recovered = await recoverPendingArtifact(
+					await resolveArtifactRoot(ctx.cwd, config.artifactRoot),
+					sessionId,
+					ctx.cwd,
+					Date.now(),
+					config.pendingTtlMs,
+				);
+				if (
+					recovered &&
+					recovered.validatedThroughEntryId ===
+						currentValidatedThroughEntryId(ctx, config)
+				) {
+					storePendingValidated(state, recovered);
+				}
+				updateSlipstreamWidget(ctx, state, config);
+			} else clearSlipstreamWidget(ctx);
+		} catch (error) {
+			ignoreStaleContextError(error);
+		}
+	});
+
+	pi.on("session_shutdown", async (_event, rawCtx) => {
+		const ctx = rawCtx as PiContext;
+		clearDeferredIdleRetry();
+		queuedTurnBoundaryWork = null;
+		clearSlipstreamWidget(ctx);
+		state.activePromise = null;
+		state.autoJob = null;
+		state.pending = null;
+		state.compactionWanted = false;
+		state.status = "idle";
+	});
+
+	pi.on("turn_end", async (rawEvent, rawCtx) => {
+		const event = rawEvent as TurnEndEvent;
+		const ctx = rawCtx as PiContext;
+		if (!config.enabled) return;
+		const canAdoptAtTurnBoundary = !isIncompleteAssistantTurn(event);
+		if (state.autoJob) {
+			state.autoJob.continuation.appendTurn(event);
+			if (state.autoJob.continuation.isReady() && ctx.modelRegistry) {
+				const branch = safeBranchEntries(ctx);
+				if (!branch) return;
+				const validatedThroughEntryId = validatedThroughEntryIdFromBranch(
+					branch,
+					config,
+				);
+				const progress = makeProgressSink(ctx, "auto", state, config);
+				const finalizeInput = {
+					state,
+					config,
+					completeSummary: createSummaryCompleter(
+						{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+						config.summaryModel,
+					),
+					completeJudge: createJudgeCompleter(
+						{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+						config.judgeModel,
+					),
+					now: () => Date.now(),
+					validatedThroughEntryId,
+					onProgress: progress,
+					signal: ctx.signal,
+				};
+				const handleFinalizeError = (error: unknown) => {
+					progress.clear();
+					state.status = "failed";
+					restorePersistentStatus(ctx, state, config);
+					const message =
+						error instanceof Error ? error.message : String(error);
+					safeNotify(
+						ctx,
+						`Slipstream auto finalize failed; compaction cancelled: ${message}`,
+						"error",
+					);
+				};
+				void finalizeAuto(finalizeInput)
+					.then(async (accepted) => {
+						progress.clear();
+						restorePersistentStatus(ctx, state, config);
+						if (accepted && canAdoptAtTurnBoundary)
+							await tryAdoptAtSafeBoundary(ctx);
+					})
+					.catch(handleFinalizeError);
+			}
+			return;
+		}
+
+		scheduleTurnBoundaryWork(event, ctx, canAdoptAtTurnBoundary);
+	});
+
+	pi.on("session_compact", async (_rawEvent, rawCtx) => {
+		const ctx = rawCtx as PiContext;
+		if (!config.enabled) return;
+		clearDeferredIdleRetry();
+		state.activePromise = null;
+		state.autoJob = null;
+		if (state.pending) await clearPendingArtifact(state.pending);
+		state.pending = null;
+		state.compactionWanted = false;
+		state.status = "idle";
+		restorePersistentStatus(ctx, state, config);
+	});
+
+	pi.on("session_before_compact", async (rawEvent, rawCtx) => {
+		const event = rawEvent as LocalCompactEvent;
+		const ctx = rawCtx as PiContext;
+		if (!config.enabled) return undefined;
+		let sessionId = "unknown";
+		let cwd = ".";
+		let branchEntries: LocalSessionEntry[] = [];
+		try {
+			sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+			cwd = ctx.cwd;
+			branchEntries = (event.branchEntries ??
+				ctx.sessionManager.getBranch()) as unknown as LocalSessionEntry[];
+		} catch (error) {
+			ignoreStaleContextError(error);
+			return undefined;
+		}
+		const pendingBeforeConsume = state.pending;
+		const consumed = consumePendingForCompaction(state, {
+			sessionId,
+			cwd,
+			preparationFirstKeptEntryId: event.preparation.firstKeptEntryId,
+			validatedThroughEntryId: buildContinuationFromBranch(
+				branchEntries,
+				config.maxContinuationTurns,
+			).triggerEntryId,
+			now: Date.now(),
+		});
+		if (consumed) {
+			clearDeferredIdleRetry();
+			if (pendingBeforeConsume)
+				await clearPendingArtifact(pendingBeforeConsume);
+			state.status = "summarizing";
+			try {
+				ctx.ui?.setStatus?.(
+					"slipstream",
+					"slipstream: compacting with prepared summary",
+				);
+			} catch (error) {
+				ignoreStaleContextError(error);
+			}
+			restorePersistentStatus(ctx, state, config);
+			return {
+				compaction: {
+					...consumed,
+					tokensBefore: event.preparation.tokensBefore,
+				},
+			};
+		}
+		try {
+			ctx.ui?.setStatus?.("slipstream", "slipstream: /compact starting");
+			updateSlipstreamWidget(ctx, state, config);
+		} catch (error) {
+			ignoreStaleContextError(error);
+		}
+		await yieldForUiPaint();
+		const progress = makeProgressSink(ctx, "compact", state, config);
+		try {
+			return await buildDefaultCompaction(
+				{ ...event, branchEntries },
+				ctx,
+				config,
+				state,
+				progress,
+			);
+		} finally {
+			progress.clear();
+			restorePersistentStatus(ctx, state, config);
+		}
+	});
+}
+
+function registerCommands(
+	pi: ExtensionAPI,
+	config: SlipstreamConfig,
+	state: RuntimeState,
+): void {
+	pi.registerCommand("slipstream", {
+		description:
+			"Default Slipstream compaction replacement. Usage: /slipstream status | artifacts | compact [--direct|--dry-run|--prepare|--adopt]",
+		getArgumentCompletions(argumentText: string) {
+			return getSlipstreamArgumentCompletions(argumentText);
+		},
+		handler: async (args: string, rawCtx) => {
+			const ctx = rawCtx as PiContext;
+			try {
+				const result = await handleSlipstreamCommand(
+					args,
+					state,
+					config,
+					ctx as unknown as Parameters<typeof handleSlipstreamCommand>[3],
+				);
+				safeNotify(ctx, result.message, result.ok ? "info" : "warning");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				safeNotify(ctx, `Slipstream error: ${message}`, "error");
+			}
+		},
+	});
+}
+
+export function getSlipstreamArgumentCompletions(
+	argumentText: string,
+): Array<{ value: string; label: string }> {
+	const text = argumentText;
+	const endsWithSpace = /\s$/.test(text);
+	const tokens = text.trim().split(/\s+/).filter(Boolean);
+	const current = endsWithSpace ? "" : (tokens.at(-1) ?? "");
+	const action = tokens[0];
+	if (!action || (!endsWithSpace && tokens.length === 1)) {
+		return ["status", "artifacts", "compact"]
+			.filter((item) => item.startsWith(current))
+			.map((item) => ({ value: item, label: item }));
+	}
+	if (action !== "compact") return [];
+	return ["--direct", "--dry-run", "--prepare", "--adopt"]
+		.filter((item) => item.startsWith(current))
+		.map((item) => ({ value: item, label: item }));
+}
+
+export default async function piSlipstreamCompact(
+	pi: ExtensionAPI,
+): Promise<void> {
+	const config = loadSettings();
+	const state = createRuntimeState();
+	registerLifecycle(pi, config, state);
+	registerCommands(pi, config, state);
+}
