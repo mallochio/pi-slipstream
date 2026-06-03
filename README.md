@@ -568,6 +568,19 @@ npm run typecheck
 npm run check
 ```
 
+CI runs `npm ci`, `npm run check`, and `npm pack --dry-run --json` on pushes to `main`, pull requests, and manual dispatches.
+
+### Release
+
+Publishing is tag-driven. The `Publish` workflow runs only for tags matching `v*.*.*`, verifies that the tag exactly matches `package.json` (`v${version}`), runs the full check suite, verifies the npm tarball contents, then publishes with npm provenance:
+
+```bash
+npm version patch --no-git-tag-version
+# review package.json/package-lock.json, commit, then tag the commit as vX.Y.Z
+```
+
+One-time npm setup: configure npm trusted publishing for `OrestesK/pi-slipstream-compact` with provider `GitHub Actions` and workflow filename `publish.yml`. The workflow uses OIDC (`id-token: write`) and does not require an `NPM_TOKEN` secret.
+
 Package layout:
 
 ```text
