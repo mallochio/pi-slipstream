@@ -52,6 +52,7 @@ export type FinalizeAutoJobInput = {
 	completeJudge: CompleteJudgeFn;
 	now: () => number;
 	validatedThroughEntryId?: string | null;
+	allowIncompleteContinuation?: boolean;
 	onProgress?: ProgressSink;
 	signal?: AbortSignal;
 };
@@ -338,7 +339,9 @@ export async function finalizeAutoJob(
 	input: FinalizeAutoJobInput,
 ): Promise<boolean> {
 	const job = input.state.autoJob;
-	if (!job || job.finalizing || !job.continuation.isReady()) return false;
+	if (!job || job.finalizing) return false;
+	if (!job.continuation.isReady() && !input.allowIncompleteContinuation)
+		return false;
 	job.finalizing = true;
 	input.state.status = "finalizing_summary";
 	input.onProgress?.({
@@ -402,6 +405,8 @@ export async function finalizeAutoJob(
 		await store.writeCandidate(run, summary);
 		if (isInvalidated()) return false;
 		const continuation = job.continuation.snapshot();
+		const continuationHasRequiredTurns =
+			continuation.turns.length >= input.config.minContinuationTurns;
 		if (isInvalidated()) return false;
 		await store.writeContinuation(run, continuation);
 		if (isInvalidated()) return false;
@@ -461,6 +466,7 @@ export async function finalizeAutoJob(
 			input.onProgress?.({
 				phase: "repairing",
 				message: `Auto repair attempt ${attempt + 1}/${input.config.repairAttempts}`,
+				lastScore: judge.score,
 			});
 			await yieldBeforeHeavyAutoWork();
 			const repairedGeneratedSummary = await input.completeSummary(
@@ -478,6 +484,7 @@ export async function finalizeAutoJob(
 					phase: "repairing",
 					message:
 						"Slipstream auto repair returned an empty or heading-only summary; retaining the previous substantive candidate and trying remaining repairs.",
+					lastScore: judge.score,
 				});
 				continue;
 			}
@@ -555,8 +562,9 @@ export async function finalizeAutoJob(
 			projectId: job.projectId,
 			summary,
 			firstKeptEntryId: job.firstKeptEntryId,
-			validatedThroughEntryId:
-				input.validatedThroughEntryId ?? continuation.triggerEntryId,
+			validatedThroughEntryId: continuationHasRequiredTurns
+				? (input.validatedThroughEntryId ?? continuation.triggerEntryId)
+				: continuation.triggerEntryId,
 			tokensBefore: job.tokensBefore,
 			details: {
 				judge,

@@ -26,7 +26,7 @@ import {
 	createRuntimeState,
 	storePendingValidated,
 } from "../src/session-state.ts";
-import type { AgentMessage, SessionEntry } from "../src/types.ts";
+import type { AgentMessage, AutoJob, SessionEntry } from "../src/types.ts";
 
 function config() {
 	return {
@@ -1096,6 +1096,134 @@ describe("auto Slipstream lifecycle", () => {
 		}
 	});
 
+	it("allows idle auto finalization to judge and repair without a later continuation turn", async () => {
+		const parent = join(process.cwd(), ".scratch", "test-tmp");
+		await mkdir(parent, { recursive: true });
+		const root = await mkdtemp(join(parent, "slipstream-auto-idle-finalize-"));
+		try {
+			const state = createRuntimeState();
+			const job = await startAutoJob({
+				state,
+				config: { ...config(), repairAttempts: 1 },
+				branchEntries: [
+					msg("u1", { role: "user", content: "Use Slipstream" }),
+					msg("a1", { role: "assistant", content: "older" }),
+					msg("u2", { role: "user", content: "more" }),
+					msg("a2", { role: "assistant", content: "more" }),
+					msg("u3", { role: "user", content: "more" }),
+					msg("a3", { role: "assistant", content: "more" }),
+					msg("u4", { role: "user", content: "more" }),
+					msg("a4", { role: "assistant", content: "more" }),
+					msg("u5", { role: "user", content: "new work" }),
+					msg("a5", { role: "assistant", content: "recent kept" }),
+				],
+				sessionId: "s-idle-finalize-auto",
+				cwd: "/repo",
+				artifactRoot: root,
+				tokensBefore: 100,
+				completeSummary: async () => "## Goal\nInitial idle summary",
+			});
+			assert.ok(job);
+			await job.summaryPromise;
+
+			let judgeCalls = 0;
+			let repairCalls = 0;
+			const accepted = await finalizeAutoJob({
+				state,
+				config: { ...config(), repairAttempts: 1 },
+				completeSummary: async () => {
+					repairCalls += 1;
+					return "## Goal\nRepaired idle summary";
+				},
+				completeJudge: async () => {
+					judgeCalls += 1;
+					return judgeCalls === 1
+						? {
+								score: 4,
+								decision: "reject",
+								missing: ["needs repair"],
+								contradictions: [],
+								diagnosis: "below threshold",
+							}
+						: {
+								score: 9,
+								decision: "accept",
+								missing: [],
+								contradictions: [],
+								diagnosis: "fixed",
+							};
+				},
+				now: () => 100,
+				validatedThroughEntryId: "a5",
+				allowIncompleteContinuation: true,
+			});
+
+			assert.equal(accepted, true);
+			assert.equal(judgeCalls, 2);
+			assert.equal(repairCalls, 1);
+			assert.equal(state.status, "ready_to_adopt");
+			assert.equal(state.pending?.validatedThroughEntryId, "a5");
+			assert.match(state.pending?.summary ?? "", /Repaired idle summary/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not stamp incomplete idle auto finalization as validated through a later branch head", async () => {
+		const parent = join(process.cwd(), ".scratch", "test-tmp");
+		await mkdir(parent, { recursive: true });
+		const root = await mkdtemp(
+			join(parent, "slipstream-auto-incomplete-head-"),
+		);
+		try {
+			const state = createRuntimeState();
+			const job = await startAutoJob({
+				state,
+				config: config(),
+				branchEntries: [
+					msg("u1", { role: "user", content: "old request" }),
+					msg("a1", { role: "assistant", content: "old answer" }),
+				],
+				sessionId: "s-incomplete-head-auto",
+				cwd: "/repo",
+				artifactRoot: root,
+				tokensBefore: 100,
+				completeSummary: async () =>
+					"## Goal\nIdle summary before later branch head",
+			});
+			assert.ok(job);
+			await job.summaryPromise;
+			const triggerEntryId = job.continuation.snapshot().triggerEntryId;
+
+			const accepted = await finalizeAutoJob({
+				state,
+				config: config(),
+				completeSummary: async () => {
+					throw new Error("repair should not run for accepted candidate");
+				},
+				completeJudge: async () => ({
+					score: 9,
+					decision: "accept",
+					missing: [],
+					contradictions: [],
+					diagnosis: "ok",
+				}),
+				now: () => 100,
+				validatedThroughEntryId: "later-branch-head",
+				allowIncompleteContinuation: true,
+			});
+
+			assert.equal(accepted, true);
+			assert.equal(state.pending?.validatedThroughEntryId, triggerEntryId);
+			assert.notEqual(
+				state.pending?.validatedThroughEntryId,
+				"later-branch-head",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("repairs auto summaries with a full rewrite before storing pending state", async () => {
 		const parent = join(process.cwd(), ".scratch", "test-tmp");
 		await mkdir(parent, { recursive: true });
@@ -1790,6 +1918,270 @@ describe("auto Slipstream lifecycle", () => {
 		]);
 	});
 
+	it("session_shutdown cancels active progress owner and timer", async () => {
+		const state = createRuntimeState();
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "ready", stopReason: "stop" }),
+		];
+		const widgetUpdates: Array<string[] | undefined> = [];
+		let releaseAutoSummary!: (summary: string) => void;
+		const autoSummaryPromise = new Promise<string>((resolve) => {
+			releaseAutoSummary = resolve;
+		});
+		const handlers: Partial<
+			Record<
+				"turn_end" | "session_shutdown",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end" || event === "session_shutdown")
+					handlers[event] = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(pi, config(), state, {
+			startAutoJob: async (input) => {
+				input.onProgress?.({
+					phase: "summary",
+					message: "Starting auto candidate summary",
+				});
+				const job: AutoJob = {
+					sessionId: input.sessionId,
+					cwd: input.cwd,
+					projectId: input.cwd,
+					snapshot: {
+						sessionId: input.sessionId,
+						cwd: input.cwd,
+						triggerEntryId: "a1",
+						firstKeptEntryId: "u1",
+						tokensBefore: 100,
+						summaryInputMessages: [],
+						keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+						manifest: {
+							filesRead: [],
+							filesModified: [],
+							filesDeleted: [],
+							errors: [],
+							userDecisions: [],
+							constraints: [],
+							openLoops: [],
+							recentVerification: [],
+							latestUpdates: [],
+							retainedTailUpdates: [],
+							latestExchangeState: [],
+							terminalFinalAnswerEvidence: [],
+							latestSignals: [],
+							staleSignals: [],
+							criticalLiterals: [],
+							previousSummary: null,
+							artifactRefs: [],
+							knownFileRefs: new Set<string>(),
+						},
+					},
+					firstKeptEntryId: "u1",
+					tokensBefore: 100,
+					artifactDir: "/tmp/slipstream-auto-progress-shutdown",
+					summaryArtifactRefs: [],
+					continuation: {
+						appendTurn: () => undefined,
+						isReady: () => false,
+						snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+					},
+					summaryPromise: autoSummaryPromise,
+					stats: autoJobStats(),
+					finalizing: false,
+				};
+				input.state.autoJob = job;
+				input.state.activePromise = autoSummaryPromise;
+				input.state.compactionWanted = false;
+				input.state.status = "awaiting_continuation";
+				return job;
+			},
+		});
+		const ctx = {
+			cwd: "/repo",
+			model: { provider: "test", id: "model" },
+			modelRegistry: {
+				find: () => ({ provider: "test", id: "model" }),
+				getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+			},
+			ui: {
+				setStatus: () => undefined,
+				setWidget: (_key: string, lines: string[] | undefined) => {
+					widgetUpdates.push(lines);
+				},
+				notify: () => undefined,
+			},
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => branch,
+			},
+			getContextUsage: () => ({ tokens: 600, contextWindow: 1000 }),
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		};
+
+		try {
+			await handlers.turn_end?.(
+				{
+					turnIndex: 1,
+					message: { role: "assistant", content: "ready", stopReason: "stop" },
+					toolResults: [],
+				},
+				ctx,
+			);
+			await waitUntil(
+				() => state.progressOwner !== null,
+				"active progress owner",
+			);
+			await handlers.session_shutdown?.({ reason: "quit" }, ctx);
+			assert.equal(state.progressOwner, null);
+			const updatesAfterShutdown = widgetUpdates.length;
+			await new Promise((resolve) => setTimeout(resolve, 1_100));
+			assert.equal(widgetUpdates.length, updatesAfterShutdown);
+			assert.equal(widgetUpdates.at(-1), undefined);
+		} finally {
+			releaseAutoSummary("## Goal\nAuto summary complete");
+		}
+	});
+
+	it("session_compact cancels active progress owner and timer", async () => {
+		const state = createRuntimeState();
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "ready", stopReason: "stop" }),
+		];
+		const widgetUpdates: Array<string[] | undefined> = [];
+		let releaseAutoSummary!: (summary: string) => void;
+		const autoSummaryPromise = new Promise<string>((resolve) => {
+			releaseAutoSummary = resolve;
+		});
+		const handlers: Partial<
+			Record<
+				"turn_end" | "session_compact",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end" || event === "session_compact")
+					handlers[event] = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(pi, config(), state, {
+			startAutoJob: async (input) => {
+				input.onProgress?.({
+					phase: "summary",
+					message: "Starting auto candidate summary",
+				});
+				const job: AutoJob = {
+					sessionId: input.sessionId,
+					cwd: input.cwd,
+					projectId: input.cwd,
+					snapshot: {
+						sessionId: input.sessionId,
+						cwd: input.cwd,
+						triggerEntryId: "a1",
+						firstKeptEntryId: "u1",
+						tokensBefore: 100,
+						summaryInputMessages: [],
+						keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+						manifest: {
+							filesRead: [],
+							filesModified: [],
+							filesDeleted: [],
+							errors: [],
+							userDecisions: [],
+							constraints: [],
+							openLoops: [],
+							recentVerification: [],
+							latestUpdates: [],
+							retainedTailUpdates: [],
+							latestExchangeState: [],
+							terminalFinalAnswerEvidence: [],
+							latestSignals: [],
+							staleSignals: [],
+							criticalLiterals: [],
+							previousSummary: null,
+							artifactRefs: [],
+							knownFileRefs: new Set<string>(),
+						},
+					},
+					firstKeptEntryId: "u1",
+					tokensBefore: 100,
+					artifactDir: "/tmp/slipstream-auto-progress-compact",
+					summaryArtifactRefs: [],
+					continuation: {
+						appendTurn: () => undefined,
+						isReady: () => false,
+						snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+					},
+					summaryPromise: autoSummaryPromise,
+					stats: autoJobStats(),
+					finalizing: false,
+				};
+				input.state.autoJob = job;
+				input.state.activePromise = autoSummaryPromise;
+				input.state.compactionWanted = false;
+				input.state.status = "awaiting_continuation";
+				return job;
+			},
+		});
+		const ctx = {
+			cwd: "/repo",
+			model: { provider: "test", id: "model" },
+			modelRegistry: {
+				find: () => ({ provider: "test", id: "model" }),
+				getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+			},
+			ui: {
+				setStatus: () => undefined,
+				setWidget: (_key: string, lines: string[] | undefined) => {
+					widgetUpdates.push(lines);
+				},
+				notify: () => undefined,
+			},
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => branch,
+			},
+			getContextUsage: () => ({ tokens: 600, contextWindow: 1000 }),
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		};
+
+		try {
+			await handlers.turn_end?.(
+				{
+					turnIndex: 1,
+					message: { role: "assistant", content: "ready", stopReason: "stop" },
+					toolResults: [],
+				},
+				ctx,
+			);
+			await waitUntil(
+				() => state.progressOwner !== null,
+				"active progress owner",
+			);
+			await handlers.session_compact?.({ firstKeptEntryId: "u1" }, ctx);
+			assert.equal(state.progressOwner, null);
+			const updatesAfterCompact = widgetUpdates.length;
+			await new Promise((resolve) => setTimeout(resolve, 1_100));
+			assert.equal(widgetUpdates.length, updatesAfterCompact);
+			assert.equal(widgetUpdates.at(-1), undefined);
+		} finally {
+			releaseAutoSummary("## Goal\nAuto summary complete");
+		}
+	});
+
 	it("session_compact clears ready widget even when status restore is stale", async () => {
 		const state = createRuntimeState();
 		storePendingValidated(state, {
@@ -2134,6 +2526,263 @@ describe("auto Slipstream lifecycle", () => {
 		assert.equal(statusUpdates.at(-1), "slipstream: manual");
 	});
 
+	it("session_before_compact does not tick footer status during a long progress phase", async () => {
+		const state = createRuntimeState();
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "ready" }),
+		];
+		const statusUpdates: Array<string | undefined> = [];
+		const widgetUpdates: Array<string[] | undefined> = [];
+		const handlers: Partial<
+			Record<
+				"session_before_compact",
+				(event: unknown, ctx: unknown) => Promise<unknown> | unknown
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown,
+			) => {
+				if (event === "session_before_compact") {
+					handlers.session_before_compact = handler;
+				}
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(pi, config(), state, {
+			buildDefaultSlipstreamCompaction: async (
+				_event,
+				_ctx,
+				_config,
+				_state,
+				onProgress,
+			) => {
+				onProgress({
+					phase: "summary",
+					message: "Generating candidate summary",
+				});
+				await new Promise((resolve) => setTimeout(resolve, 1_100));
+				onProgress({
+					phase: "accepted",
+					message: "Accepted summary with score 9",
+				});
+				return {
+					compaction: {
+						summary: "## Goal\nReady summary",
+						firstKeptEntryId: "a1",
+						tokensBefore: 100,
+						details: { judge: { score: 9 }, artifacts: [] },
+					},
+				};
+			},
+		});
+
+		await handlers.session_before_compact?.(
+			{
+				preparation: { firstKeptEntryId: "native-boundary", tokensBefore: 100 },
+				branchEntries: branch,
+			},
+			{
+				cwd: "/repo",
+				ui: {
+					setStatus: (_key: string, text: string | undefined) => {
+						statusUpdates.push(text);
+					},
+					setWidget: (_key: string, lines: string[] | undefined) => {
+						widgetUpdates.push(lines);
+					},
+					notify: () => undefined,
+				},
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+			},
+		);
+
+		assert.equal(
+			statusUpdates.filter((text) => text?.includes("compact 4/5 summary"))
+				.length,
+			1,
+		);
+		assert.ok(
+			widgetUpdates.filter((lines) => lines?.join("\n").includes("summarizing"))
+				.length >= 2,
+		);
+		assert.equal(statusUpdates.at(-1), "slipstream: manual");
+	});
+
+	it("stale auto progress does not overwrite newer compact progress", async () => {
+		const state = createRuntimeState();
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "ready", stopReason: "stop" }),
+		];
+		const widgetUpdates: Array<string[] | undefined> = [];
+		let releaseAutoSummary!: (summary: string) => void;
+		const autoSummaryPromise = new Promise<string>((resolve) => {
+			releaseAutoSummary = resolve;
+		});
+		const handlers: Partial<
+			Record<
+				"turn_end" | "session_before_compact",
+				(event: unknown, ctx: unknown) => Promise<unknown> | unknown
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown,
+			) => {
+				if (event === "turn_end" || event === "session_before_compact") {
+					handlers[event] = handler;
+				}
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(pi, config(), state, {
+			startAutoJob: async (input) => {
+				input.onProgress?.({
+					phase: "summary",
+					message: "Starting auto candidate summary",
+				});
+				const job: AutoJob = {
+					sessionId: input.sessionId,
+					cwd: input.cwd,
+					projectId: input.cwd,
+					snapshot: {
+						sessionId: input.sessionId,
+						cwd: input.cwd,
+						triggerEntryId: "a1",
+						firstKeptEntryId: "u1",
+						tokensBefore: 100,
+						summaryInputMessages: [],
+						keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+						manifest: {
+							filesRead: [],
+							filesModified: [],
+							filesDeleted: [],
+							errors: [],
+							userDecisions: [],
+							constraints: [],
+							openLoops: [],
+							recentVerification: [],
+							latestUpdates: [],
+							retainedTailUpdates: [],
+							latestExchangeState: [],
+							terminalFinalAnswerEvidence: [],
+							latestSignals: [],
+							staleSignals: [],
+							criticalLiterals: [],
+							previousSummary: null,
+							artifactRefs: [],
+							knownFileRefs: new Set<string>(),
+						},
+					},
+					firstKeptEntryId: "u1",
+					tokensBefore: 100,
+					artifactDir: "/tmp/slipstream-auto-progress-race",
+					summaryArtifactRefs: [],
+					continuation: {
+						appendTurn: () => undefined,
+						isReady: () => false,
+						snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+					},
+					summaryPromise: autoSummaryPromise,
+					stats: autoJobStats(),
+					finalizing: false,
+				};
+				input.state.autoJob = job;
+				input.state.activePromise = autoSummaryPromise;
+				input.state.compactionWanted = false;
+				input.state.status = "awaiting_continuation";
+				return job;
+			},
+			buildDefaultSlipstreamCompaction: async (
+				_event,
+				_ctx,
+				_config,
+				_state,
+				onProgress,
+			) => {
+				onProgress({ phase: "repairing", message: "Repair attempt 1/1" });
+				await new Promise((resolve) => setTimeout(resolve, 1_600));
+				return {
+					compaction: {
+						summary: "## Goal\nReady summary",
+						firstKeptEntryId: "a1",
+						tokensBefore: 100,
+						details: { judge: { score: 9 }, artifacts: [] },
+					},
+				};
+			},
+		});
+		const ctx = {
+			cwd: "/repo",
+			model: { provider: "test", id: "model" },
+			modelRegistry: {
+				find: () => ({ provider: "test", id: "model" }),
+				getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+			},
+			ui: {
+				setStatus: () => undefined,
+				setWidget: (_key: string, lines: string[] | undefined) => {
+					widgetUpdates.push(lines);
+				},
+				notify: () => undefined,
+			},
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => branch,
+			},
+			getContextUsage: () => ({ tokens: 600, contextWindow: 1000 }),
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		};
+
+		try {
+			await handlers.turn_end?.(
+				{
+					turnIndex: 1,
+					message: { role: "assistant", content: "ready", stopReason: "stop" },
+					toolResults: [],
+				},
+				ctx,
+			);
+			await waitUntil(
+				() =>
+					widgetUpdates.some((lines) =>
+						lines?.join("\n").includes("summarizing"),
+					),
+				"initial auto summary progress",
+			);
+			const beforeCompact = widgetUpdates.length;
+			await handlers.session_before_compact?.(
+				{
+					preparation: {
+						firstKeptEntryId: "native-boundary",
+						tokensBefore: 100,
+					},
+					branchEntries: branch,
+				},
+				ctx,
+			);
+			const compactUpdates = widgetUpdates.slice(beforeCompact);
+			const firstRepairIndex = compactUpdates.findIndex((lines) =>
+				lines?.join("\n").includes("repairing summary"),
+			);
+			assert.notEqual(firstRepairIndex, -1);
+			assert.equal(
+				compactUpdates
+					.slice(firstRepairIndex)
+					.some((lines) => lines?.join("\n").includes("summarizing")),
+				false,
+			);
+		} finally {
+			releaseAutoSummary("## Goal\nAuto summary complete");
+		}
+	});
+
 	it("session_before_compact yields after initial status before default work", async () => {
 		const state = createRuntimeState();
 		const branch = [msg("a1", { role: "assistant", content: "ready" })];
@@ -2241,6 +2890,759 @@ describe("auto Slipstream lifecycle", () => {
 			"auto start status restore",
 		);
 		assert.equal(state.compactionWanted, false);
+	});
+
+	it("auto start completion finalizes and adopts while idle without another turn", async () => {
+		const state = createRuntimeState();
+		let finalizeCalls = 0;
+		let compactCalls = 0;
+		let capturedAllowIncomplete: boolean | undefined;
+		const handlers: Partial<
+			Record<"turn_end", (event: unknown, ctx: unknown) => Promise<void> | void>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		const branch = [
+			msg("u1", { role: "user", content: "continue" }),
+			msg("a1", { role: "assistant", content: "done", stopReason: "stop" }),
+		];
+
+		registerLifecycle(
+			pi,
+			{ ...config(), triggerContextPercent: 0.001 },
+			state,
+			{
+				startAutoJob: async (input) => {
+					const summaryPromise = Promise.resolve("## Goal\nIdle auto summary");
+					const job: AutoJob = {
+						sessionId: input.sessionId,
+						cwd: input.cwd,
+						projectId: input.cwd,
+						snapshot: {
+							sessionId: input.sessionId,
+							cwd: input.cwd,
+							triggerEntryId: "a1",
+							firstKeptEntryId: "u1",
+							tokensBefore: 100,
+							summaryInputMessages: [],
+							keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+							manifest: {
+								filesRead: [],
+								filesModified: [],
+								filesDeleted: [],
+								errors: [],
+								userDecisions: [],
+								constraints: [],
+								openLoops: [],
+								recentVerification: [],
+								latestUpdates: [],
+								retainedTailUpdates: [],
+								latestExchangeState: [],
+								terminalFinalAnswerEvidence: [],
+								latestSignals: [],
+								staleSignals: [],
+								criticalLiterals: [],
+								previousSummary: null,
+								artifactRefs: [],
+								knownFileRefs: new Set<string>(),
+							},
+						},
+						firstKeptEntryId: "u1",
+						tokensBefore: 100,
+						artifactDir: "/tmp/slipstream-idle-auto",
+						summaryArtifactRefs: [],
+						continuation: {
+							appendTurn: () => undefined,
+							isReady: () => false,
+							snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+						},
+						summaryPromise,
+						stats: autoJobStats(),
+						finalizing: false,
+					};
+					input.state.autoJob = job;
+					input.state.activePromise = summaryPromise;
+					input.state.compactionWanted = false;
+					input.state.status = "awaiting_continuation";
+					return job;
+				},
+				finalizeAutoJob: async (input) => {
+					finalizeCalls += 1;
+					capturedAllowIncomplete = input.allowIncompleteContinuation;
+					storePendingValidated(input.state, {
+						sessionId: "s1",
+						cwd: "/repo",
+						projectId: "/repo",
+						summary: "## Goal\nIdle auto accepted",
+						firstKeptEntryId: "u1",
+						validatedThroughEntryId: "a1",
+						tokensBefore: 100,
+						details: { judge: { score: 9 }, artifacts: [] },
+						expiresAt: Date.now() + 10_000,
+					});
+					input.state.autoJob = null;
+					return true;
+				},
+			},
+		);
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: { role: "assistant", content: "done", stopReason: "stop" },
+				toolResults: [],
+			},
+			{
+				cwd: "/repo",
+				model: { provider: "test", id: "model" },
+				modelRegistry: {
+					find: () => ({ provider: "test", id: "model" }),
+					getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+				},
+				ui: { setStatus: () => undefined, notify: () => undefined },
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+				getContextUsage: () => ({ tokens: 600, contextWindow: 1000 }),
+				isIdle: () => true,
+				hasPendingMessages: () => false,
+				compact: () => {
+					compactCalls += 1;
+				},
+			},
+		);
+
+		await waitUntil(() => finalizeCalls === 1, "idle auto finalization");
+		await waitUntil(() => compactCalls === 1, "idle auto adoption");
+		assert.equal(capturedAllowIncomplete, true);
+	});
+
+	it("auto start completion keeps retrying idle finalization after the first retry sees Pi busy", async () => {
+		const state = createRuntimeState();
+		let finalizeCalls = 0;
+		let compactCalls = 0;
+		let idle = false;
+		let autoJobIdleChecks = 0;
+		const handlers: Partial<
+			Record<"turn_end", (event: unknown, ctx: unknown) => Promise<void> | void>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		const branch = [
+			msg("u1", { role: "user", content: "continue" }),
+			msg("a1", { role: "assistant", content: "done", stopReason: "stop" }),
+		];
+
+		registerLifecycle(
+			pi,
+			{ ...config(), triggerContextPercent: 0.001 },
+			state,
+			{
+				startAutoJob: async (input) => {
+					const summaryPromise = Promise.resolve("## Goal\nIdle auto summary");
+					const job: AutoJob = {
+						sessionId: input.sessionId,
+						cwd: input.cwd,
+						projectId: input.cwd,
+						snapshot: {
+							sessionId: input.sessionId,
+							cwd: input.cwd,
+							triggerEntryId: "a1",
+							firstKeptEntryId: "u1",
+							tokensBefore: 100,
+							summaryInputMessages: [],
+							keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+							manifest: {
+								filesRead: [],
+								filesModified: [],
+								filesDeleted: [],
+								errors: [],
+								userDecisions: [],
+								constraints: [],
+								openLoops: [],
+								recentVerification: [],
+								latestUpdates: [],
+								retainedTailUpdates: [],
+								latestExchangeState: [],
+								terminalFinalAnswerEvidence: [],
+								latestSignals: [],
+								staleSignals: [],
+								criticalLiterals: [],
+								previousSummary: null,
+								artifactRefs: [],
+								knownFileRefs: new Set<string>(),
+							},
+						},
+						firstKeptEntryId: "u1",
+						tokensBefore: 100,
+						artifactDir: "/tmp/slipstream-idle-auto",
+						summaryArtifactRefs: [],
+						continuation: {
+							appendTurn: () => undefined,
+							isReady: () => false,
+							snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+						},
+						summaryPromise,
+						stats: autoJobStats(),
+						finalizing: false,
+					};
+					input.state.autoJob = job;
+					input.state.activePromise = summaryPromise;
+					input.state.compactionWanted = false;
+					input.state.status = "awaiting_continuation";
+					return job;
+				},
+				finalizeAutoJob: async (input) => {
+					finalizeCalls += 1;
+					storePendingValidated(input.state, {
+						sessionId: "s1",
+						cwd: "/repo",
+						projectId: "/repo",
+						summary: "## Goal\nIdle auto accepted",
+						firstKeptEntryId: "u1",
+						validatedThroughEntryId: "a1",
+						tokensBefore: 100,
+						details: { judge: { score: 9 }, artifacts: [] },
+						expiresAt: Date.now() + 10_000,
+					});
+					input.state.autoJob = null;
+					return true;
+				},
+			},
+		);
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: { role: "assistant", content: "done", stopReason: "stop" },
+				toolResults: [],
+			},
+			{
+				cwd: "/repo",
+				model: { provider: "test", id: "model" },
+				modelRegistry: {
+					find: () => ({ provider: "test", id: "model" }),
+					getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+				},
+				ui: { setStatus: () => undefined, notify: () => undefined },
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+				getContextUsage: () => ({ tokens: 600, contextWindow: 1000 }),
+				isIdle: () => {
+					if (state.autoJob) autoJobIdleChecks += 1;
+					return idle;
+				},
+				hasPendingMessages: () => false,
+				compact: () => {
+					compactCalls += 1;
+				},
+			},
+		);
+
+		await waitUntil(
+			() => autoJobIdleChecks === 1,
+			"first busy auto idle check",
+		);
+		assert.equal(finalizeCalls, 0);
+		idle = true;
+		await waitUntil(
+			() => finalizeCalls === 1,
+			"busy-to-idle auto finalization",
+		);
+		await waitUntil(() => compactCalls === 1, "busy-to-idle auto adoption");
+	});
+
+	it("idle auto finalization defers while pending messages exist", async () => {
+		const state = createRuntimeState();
+		let finalizeCalls = 0;
+		let compactCalls = 0;
+		let hasPendingMessages = true;
+		let autoJobIdleChecks = 0;
+		const handlers: Partial<
+			Record<"turn_end", (event: unknown, ctx: unknown) => Promise<void> | void>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		const branch = [
+			msg("u1", { role: "user", content: "continue" }),
+			msg("a1", { role: "assistant", content: "done", stopReason: "stop" }),
+		];
+
+		registerLifecycle(
+			pi,
+			{ ...config(), triggerContextPercent: 0.001 },
+			state,
+			{
+				startAutoJob: async (input) => {
+					const summaryPromise = Promise.resolve("## Goal\nIdle auto summary");
+					const job: AutoJob = {
+						sessionId: input.sessionId,
+						cwd: input.cwd,
+						projectId: input.cwd,
+						snapshot: {
+							sessionId: input.sessionId,
+							cwd: input.cwd,
+							triggerEntryId: "a1",
+							firstKeptEntryId: "u1",
+							tokensBefore: 100,
+							summaryInputMessages: [],
+							keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+							manifest: {
+								filesRead: [],
+								filesModified: [],
+								filesDeleted: [],
+								errors: [],
+								userDecisions: [],
+								constraints: [],
+								openLoops: [],
+								recentVerification: [],
+								latestUpdates: [],
+								retainedTailUpdates: [],
+								latestExchangeState: [],
+								terminalFinalAnswerEvidence: [],
+								latestSignals: [],
+								staleSignals: [],
+								criticalLiterals: [],
+								previousSummary: null,
+								artifactRefs: [],
+								knownFileRefs: new Set<string>(),
+							},
+						},
+						firstKeptEntryId: "u1",
+						tokensBefore: 100,
+						artifactDir: "/tmp/slipstream-idle-auto",
+						summaryArtifactRefs: [],
+						continuation: {
+							appendTurn: () => undefined,
+							isReady: () => false,
+							snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+						},
+						summaryPromise,
+						stats: autoJobStats(),
+						finalizing: false,
+					};
+					input.state.autoJob = job;
+					input.state.activePromise = summaryPromise;
+					input.state.compactionWanted = false;
+					input.state.status = "awaiting_continuation";
+					return job;
+				},
+				finalizeAutoJob: async (input) => {
+					finalizeCalls += 1;
+					storePendingValidated(input.state, {
+						sessionId: "s1",
+						cwd: "/repo",
+						projectId: "/repo",
+						summary: "## Goal\nIdle auto accepted",
+						firstKeptEntryId: "u1",
+						validatedThroughEntryId: "a1",
+						tokensBefore: 100,
+						details: { judge: { score: 9 }, artifacts: [] },
+						expiresAt: Date.now() + 10_000,
+					});
+					input.state.autoJob = null;
+					return true;
+				},
+			},
+		);
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: { role: "assistant", content: "done", stopReason: "stop" },
+				toolResults: [],
+			},
+			{
+				cwd: "/repo",
+				model: { provider: "test", id: "model" },
+				modelRegistry: {
+					find: () => ({ provider: "test", id: "model" }),
+					getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+				},
+				ui: { setStatus: () => undefined, notify: () => undefined },
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+				getContextUsage: () => ({ tokens: 600, contextWindow: 1000 }),
+				isIdle: () => {
+					if (state.autoJob) autoJobIdleChecks += 1;
+					return true;
+				},
+				hasPendingMessages: () => hasPendingMessages,
+				compact: () => {
+					compactCalls += 1;
+				},
+			},
+		);
+
+		await waitUntil(
+			() => autoJobIdleChecks === 1,
+			"first pending-message auto readiness check",
+		);
+		assert.equal(finalizeCalls, 0);
+		hasPendingMessages = false;
+		await waitUntil(
+			() => finalizeCalls === 1,
+			"pending-message-cleared auto finalization",
+		);
+		await waitUntil(
+			() => compactCalls === 1,
+			"pending-message-cleared auto adoption",
+		);
+	});
+
+	for (const drift of ["session", "cwd"] as const) {
+		it(`idle auto finalization aborts after ${drift} drift`, async () => {
+			const state = createRuntimeState();
+			let releaseSummary!: (summary: string) => void;
+			const summaryPromise = new Promise<string>((resolve) => {
+				releaseSummary = resolve;
+			});
+			let finalizeCalls = 0;
+			let sessionId = "s1";
+			let cwd = "/repo";
+			const handlers: Partial<
+				Record<
+					"turn_end",
+					(event: unknown, ctx: unknown) => Promise<void> | void
+				>
+			> = {};
+			const pi = {
+				on: (
+					event: string,
+					handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+				) => {
+					if (event === "turn_end") handlers.turn_end = handler;
+				},
+			} as unknown as Parameters<typeof registerLifecycle>[0];
+			const branch = [
+				msg("u1", { role: "user", content: "continue" }),
+				msg("a1", { role: "assistant", content: "done", stopReason: "stop" }),
+			];
+
+			registerLifecycle(
+				pi,
+				{ ...config(), triggerContextPercent: 0.001 },
+				state,
+				{
+					startAutoJob: async (input) => {
+						const job: AutoJob = {
+							sessionId: input.sessionId,
+							cwd: input.cwd,
+							projectId: input.cwd,
+							snapshot: {
+								sessionId: input.sessionId,
+								cwd: input.cwd,
+								triggerEntryId: "a1",
+								firstKeptEntryId: "u1",
+								tokensBefore: 100,
+								summaryInputMessages: [],
+								keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+								manifest: {
+									filesRead: [],
+									filesModified: [],
+									filesDeleted: [],
+									errors: [],
+									userDecisions: [],
+									constraints: [],
+									openLoops: [],
+									recentVerification: [],
+									latestUpdates: [],
+									retainedTailUpdates: [],
+									latestExchangeState: [],
+									terminalFinalAnswerEvidence: [],
+									latestSignals: [],
+									staleSignals: [],
+									criticalLiterals: [],
+									previousSummary: null,
+									artifactRefs: [],
+									knownFileRefs: new Set<string>(),
+								},
+							},
+							firstKeptEntryId: "u1",
+							tokensBefore: 100,
+							artifactDir: "/tmp/slipstream-idle-auto",
+							summaryArtifactRefs: [],
+							continuation: {
+								appendTurn: () => undefined,
+								isReady: () => false,
+								snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+							},
+							summaryPromise,
+							stats: autoJobStats(),
+							finalizing: false,
+						};
+						input.state.autoJob = job;
+						input.state.activePromise = summaryPromise;
+						input.state.compactionWanted = false;
+						input.state.status = "awaiting_continuation";
+						return job;
+					},
+					finalizeAutoJob: async () => {
+						finalizeCalls += 1;
+						return true;
+					},
+				},
+			);
+
+			await handlers.turn_end?.(
+				{
+					turnIndex: 1,
+					message: { role: "assistant", content: "done", stopReason: "stop" },
+					toolResults: [],
+				},
+				{
+					get cwd() {
+						return cwd;
+					},
+					model: { provider: "test", id: "model" },
+					modelRegistry: {
+						find: () => ({ provider: "test", id: "model" }),
+						getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+					},
+					ui: { setStatus: () => undefined, notify: () => undefined },
+					sessionManager: {
+						getSessionId: () => sessionId,
+						getBranch: () => branch,
+					},
+					getContextUsage: () => ({ tokens: 600, contextWindow: 1000 }),
+					isIdle: () => true,
+					hasPendingMessages: () => false,
+				},
+			);
+
+			if (drift === "session") sessionId = "s2";
+			else cwd = "/other";
+			releaseSummary("## Goal\nSummary resolved after drift");
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(finalizeCalls, 0);
+			assert.equal(state.autoJob, null);
+			assert.equal(state.status, "idle");
+		});
+	}
+
+	it("idle auto finalization revalidates a stale incomplete pending summary before adopting", async () => {
+		const parent = join(process.cwd(), ".scratch", "test-tmp");
+		await mkdir(parent, { recursive: true });
+		const artifactDir = await mkdtemp(
+			join(parent, "slipstream-idle-revalidate-"),
+		);
+		try {
+			const cwd = process.cwd();
+			const state = createRuntimeState();
+			let branch = [
+				msg("u1", { role: "user", content: "old request" }),
+				msg("a1", {
+					role: "assistant",
+					content: "old answer",
+					stopReason: "stop",
+				}),
+			];
+			const advancedBranch = [
+				...branch,
+				msg("u2", { role: "user", content: "new work" }),
+				msg("a2", {
+					role: "assistant",
+					content: "new answer",
+					stopReason: "stop",
+				}),
+			];
+			let releaseSummary!: (summary: string) => void;
+			const summaryPromise = new Promise<string>((resolve) => {
+				releaseSummary = resolve;
+			});
+			let startCalls = 0;
+			let finalizeCalls = 0;
+			let revalidationCalls = 0;
+			let compactCalls = 0;
+			const handlers: Partial<
+				Record<
+					"turn_end",
+					(event: unknown, ctx: unknown) => Promise<void> | void
+				>
+			> = {};
+			const pi = {
+				on: (
+					event: string,
+					handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+				) => {
+					if (event === "turn_end") handlers.turn_end = handler;
+				},
+			} as unknown as Parameters<typeof registerLifecycle>[0];
+			registerLifecycle(
+				pi,
+				{
+					...config(),
+					triggerContextPercent: 0.001,
+					artifactRoot: artifactDir,
+				},
+				state,
+				{
+					startAutoJob: async (input) => {
+						startCalls += 1;
+						const job: AutoJob = {
+							sessionId: input.sessionId,
+							cwd: input.cwd,
+							projectId: input.cwd,
+							snapshot: {
+								sessionId: input.sessionId,
+								cwd: input.cwd,
+								triggerEntryId: "a1",
+								firstKeptEntryId: "u1",
+								tokensBefore: 100,
+								summaryInputMessages: [],
+								keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+								manifest: {
+									filesRead: [],
+									filesModified: [],
+									filesDeleted: [],
+									errors: [],
+									userDecisions: [],
+									constraints: [],
+									openLoops: [],
+									recentVerification: [],
+									latestUpdates: [],
+									retainedTailUpdates: [],
+									latestExchangeState: [],
+									terminalFinalAnswerEvidence: [],
+									latestSignals: [],
+									staleSignals: [],
+									criticalLiterals: [],
+									previousSummary: null,
+									artifactRefs: [],
+									knownFileRefs: new Set<string>(),
+								},
+							},
+							firstKeptEntryId: "u1",
+							tokensBefore: 100,
+							artifactDir,
+							summaryArtifactRefs: [],
+							continuation: {
+								appendTurn: () => undefined,
+								isReady: () => false,
+								snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+							},
+							summaryPromise,
+							stats: autoJobStats(),
+							finalizing: false,
+						};
+						input.state.autoJob = job;
+						input.state.activePromise = summaryPromise;
+						input.state.compactionWanted = false;
+						input.state.status = "awaiting_continuation";
+						return job;
+					},
+					finalizeAutoJob: async (input) => {
+						finalizeCalls += 1;
+						assert.equal(input.allowIncompleteContinuation, true);
+						storePendingValidated(input.state, {
+							sessionId: "s1",
+							cwd,
+							projectId: cwd,
+							summary: "## Goal\nNeeds idle revalidation",
+							firstKeptEntryId: "u1",
+							validatedThroughEntryId: "a1",
+							tokensBefore: 100,
+							details: {
+								judge: { score: 9 },
+								artifacts: [artifactDir],
+								auto: true,
+							},
+							expiresAt: Date.now() + 10_000,
+						});
+						input.state.autoJob = null;
+						return true;
+					},
+					runValidatedSlipstream: async (): Promise<ValidatedRunResult> => {
+						revalidationCalls += 1;
+						return {
+							mode: "validated",
+							accepted: true,
+							repaired: false,
+							artifactDir,
+							summary: "## Goal\nIdle revalidated summary",
+							judge: {
+								score: 9,
+								decision: "accept",
+								missing: [],
+								contradictions: [],
+								diagnosis: "ok",
+							},
+							firstKeptEntryId: "u2",
+							tokensBefore: 200,
+						};
+					},
+				},
+			);
+
+			const ctx = {
+				cwd,
+				model: { provider: "test", id: "model" },
+				modelRegistry: {
+					find: () => ({ provider: "test", id: "model" }),
+					getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+				},
+				ui: { setStatus: () => undefined, notify: () => undefined },
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+				getContextUsage: () => ({ tokens: 600, contextWindow: 1000 }),
+				isIdle: () => true,
+				hasPendingMessages: () => false,
+				compact: () => {
+					compactCalls += 1;
+				},
+			};
+
+			await handlers.turn_end?.(
+				{
+					turnIndex: 1,
+					message: {
+						role: "assistant",
+						content: "old answer",
+						stopReason: "stop",
+					},
+					toolResults: [],
+				},
+				ctx,
+			);
+			await waitUntil(
+				() => startCalls === 1,
+				"auto start before idle revalidation",
+			);
+			branch = advancedBranch;
+			releaseSummary("## Goal\nSummary resolved while idle");
+
+			await waitUntil(() => finalizeCalls === 1, "idle stale finalization");
+			await waitUntil(() => revalidationCalls === 1, "idle stale revalidation");
+			await waitUntil(() => compactCalls === 1, "idle revalidated adoption");
+			assert.equal(state.pending?.validatedThroughEntryId, "a2");
+		} finally {
+			await rm(artifactDir, { recursive: true, force: true });
+		}
 	});
 
 	it("auto finalization shows progress and restores pending status", async () => {
@@ -3521,6 +4923,9 @@ describe("auto Slipstream lifecycle", () => {
 	it("turn_end ignores stale getBranch before auto finalization", async () => {
 		const state = createRuntimeState();
 		state.autoJob = {
+			sessionId: "s1",
+			cwd: "/repo",
+			summaryPromise: Promise.resolve("## Goal\nAuto summary"),
 			continuation: {
 				appendTurn: () => undefined,
 				isReady: () => true,
@@ -3757,6 +5162,143 @@ describe("auto Slipstream lifecycle", () => {
 		idle = true;
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.equal(compactCalls, 1);
+		assert.equal(state.status, "summarizing");
+	});
+
+	it("idle boundary keeps retrying pending adoption after the first retry sees Pi busy", async () => {
+		const state = createRuntimeState();
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nReady",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 100,
+			details: { judge: { score: 8 }, artifacts: [] },
+			expiresAt: 4_000_000_000_000,
+		});
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "ready" }),
+		];
+		let compactCalls = 0;
+		let idle = false;
+		let pendingIdleChecks = 0;
+		const handlers: Partial<
+			Record<"turn_end", (event: unknown, ctx: unknown) => Promise<void> | void>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(pi, config(), state);
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: { role: "assistant", content: "ready", stopReason: "stop" },
+				toolResults: [],
+			},
+			{
+				cwd: "/repo",
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+				getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+				compact: () => {
+					compactCalls += 1;
+				},
+				isIdle: () => {
+					if (state.pending) pendingIdleChecks += 1;
+					return idle;
+				},
+				hasPendingMessages: () => false,
+			},
+		);
+
+		await waitUntil(
+			() => pendingIdleChecks >= 2,
+			"first busy pending idle retry",
+		);
+		assert.equal(compactCalls, 0);
+		idle = true;
+		await waitUntil(() => compactCalls === 1, "busy-to-idle pending adoption");
+		assert.equal(state.status, "summarizing");
+	});
+
+	it("idle prepared adoption does not fire while pending messages exist", async () => {
+		const state = createRuntimeState();
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nReady",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 100,
+			details: { judge: { score: 8 }, artifacts: [] },
+			expiresAt: 4_000_000_000_000,
+		});
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "ready" }),
+		];
+		let compactCalls = 0;
+		let hasPendingMessages = true;
+		let pendingReadinessChecks = 0;
+		const handlers: Partial<
+			Record<"turn_end", (event: unknown, ctx: unknown) => Promise<void> | void>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(pi, config(), state);
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: { role: "assistant", content: "ready", stopReason: "stop" },
+				toolResults: [],
+			},
+			{
+				cwd: "/repo",
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+				getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+				compact: () => {
+					compactCalls += 1;
+				},
+				isIdle: () => true,
+				hasPendingMessages: () => {
+					if (state.pending) pendingReadinessChecks += 1;
+					return hasPendingMessages;
+				},
+			},
+		);
+
+		await waitUntil(
+			() => pendingReadinessChecks >= 2,
+			"pending-message adoption readiness check",
+		);
+		assert.equal(compactCalls, 0);
+		hasPendingMessages = false;
+		await waitUntil(
+			() => compactCalls === 1,
+			"pending-message-cleared adoption",
+		);
 		assert.equal(state.status, "summarizing");
 	});
 
@@ -4621,6 +6163,9 @@ describe("auto Slipstream lifecycle", () => {
 	it("turn_end auto finalize failure marks failed and notifies", async () => {
 		const state = createRuntimeState();
 		state.autoJob = {
+			sessionId: "s1",
+			cwd: "/repo",
+			summaryPromise: Promise.resolve("## Goal\nAuto summary"),
 			continuation: {
 				appendTurn: () => undefined,
 				isReady: () => true,
@@ -4818,5 +6363,780 @@ describe("auto Slipstream lifecycle", () => {
 
 		assert.equal(compactCalls, 0);
 		assert.equal(state.pending, null);
+	});
+
+	it("session_tree clears stale pending state and widget", async () => {
+		const state = createRuntimeState();
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nFuture branch pending",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "future-head",
+			tokensBefore: 100,
+			details: { judge: { score: 9 }, artifacts: [] },
+			expiresAt: Date.now() + 10_000,
+		});
+		const statuses: Array<string | undefined> = [];
+		const widgets: Array<string | undefined> = [];
+		const handlers: Partial<
+			Record<
+				"session_tree",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "session_tree") handlers.session_tree = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+
+		registerLifecycle(pi, config(), state);
+
+		assert.equal(typeof handlers.session_tree, "function");
+		await handlers.session_tree?.(
+			{ oldLeafId: "future-head", newLeafId: "rewound-head" },
+			{
+				cwd: "/repo",
+				ui: {
+					setStatus: (_key: string, text: string | undefined) => {
+						statuses.push(text);
+					},
+					setWidget: (_key: string, text: string | undefined) => {
+						widgets.push(text);
+					},
+				},
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => [
+						msg("u0", { role: "user", content: "rewound" }),
+						msg("rewound-head", {
+							role: "assistant",
+							content: "rewound branch head",
+						}),
+					],
+				},
+			},
+		);
+
+		assert.equal(state.pending, null);
+		assert.equal(state.status, "idle");
+		assert.equal(statuses.at(-1), "slipstream: manual");
+		assert.equal(widgets.at(-1), undefined);
+	});
+
+	it("session_tree keeps pending state that matches the rewound branch", async () => {
+		const state = createRuntimeState();
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nCurrent pending",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "rewound-head",
+			tokensBefore: 100,
+			details: { judge: { score: 9 }, artifacts: [] },
+			expiresAt: Date.now() + 10_000,
+		});
+		const widgets: Array<string[] | undefined> = [];
+		const handlers: Partial<
+			Record<
+				"session_tree",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "session_tree") handlers.session_tree = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+
+		registerLifecycle(pi, config(), state);
+
+		assert.equal(typeof handlers.session_tree, "function");
+		await handlers.session_tree?.(
+			{ oldLeafId: "future-head", newLeafId: "rewound-head" },
+			{
+				cwd: "/repo",
+				ui: {
+					setStatus: () => undefined,
+					setWidget: (_key: string, lines: string[] | undefined) => {
+						widgets.push(lines);
+					},
+				},
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => [
+						msg("u0", { role: "user", content: "rewound" }),
+						msg("rewound-head", {
+							role: "assistant",
+							content: "rewound branch head",
+						}),
+					],
+				},
+			},
+		);
+
+		assert.equal(state.pending?.validatedThroughEntryId, "rewound-head");
+		assert.equal(state.status, "ready_to_adopt");
+		assert.match(widgets.at(-1)?.join("\n") ?? "", /ready/);
+	});
+
+	it("session_tree invalidates in-flight auto work before later turn_end", async () => {
+		const state = createRuntimeState();
+		let appended = false;
+		state.activePromise = Promise.resolve("## Goal\nOld auto summary");
+		state.autoJob = {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			snapshot: {
+				sessionId: "s1",
+				cwd: "/repo",
+				triggerEntryId: "future-head",
+				firstKeptEntryId: "future-head",
+				tokensBefore: 100,
+				summaryInputMessages: [],
+				keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "future-head" },
+				manifest: {
+					filesRead: [],
+					filesModified: [],
+					filesDeleted: [],
+					errors: [],
+					userDecisions: [],
+					constraints: [],
+					openLoops: [],
+					recentVerification: [],
+					latestUpdates: [],
+					retainedTailUpdates: [],
+					latestExchangeState: [],
+					terminalFinalAnswerEvidence: [],
+					latestSignals: [],
+					staleSignals: [],
+					criticalLiterals: [],
+					previousSummary: null,
+					artifactRefs: [],
+					knownFileRefs: new Set<string>(),
+				},
+			},
+			firstKeptEntryId: "future-head",
+			tokensBefore: 100,
+			artifactDir: "/tmp/slipstream-test",
+			summaryArtifactRefs: [],
+			continuation: {
+				appendTurn: () => {
+					appended = true;
+				},
+				isReady: () => true,
+				snapshot: () => ({ triggerEntryId: "future-head", turns: [] }),
+			},
+			summaryPromise: state.activePromise as Promise<string>,
+			stateEvidence: undefined,
+			maxConversationChars: 1000,
+			stats: autoJobStats(),
+			finalizing: false,
+		} as AutoJob;
+		state.status = "awaiting_continuation";
+
+		let finalizeCalls = 0;
+		const handlers: Partial<
+			Record<
+				"session_tree" | "turn_end",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "session_tree") handlers.session_tree = handler;
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+
+		registerLifecycle(pi, config(), state, {
+			finalizeAutoJob: async () => {
+				finalizeCalls += 1;
+				return true;
+			},
+		});
+		const ctx = {
+			cwd: "/repo",
+			model: { provider: "test", id: "model" },
+			modelRegistry: {
+				find: () => ({ provider: "test", id: "model" }),
+				getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+			},
+			ui: { setStatus: () => undefined, setWidget: () => undefined },
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => [
+					msg("u0", { role: "user", content: "rewound" }),
+					msg("rewound-head", {
+						role: "assistant",
+						content: "rewound branch head",
+					}),
+				],
+			},
+			getContextUsage: () => ({ tokens: 1_000, contextWindow: 100_000 }),
+			compact: () => undefined,
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		};
+
+		assert.equal(typeof handlers.session_tree, "function");
+		await handlers.session_tree?.(
+			{ oldLeafId: "future-head", newLeafId: "rewound-head" },
+			ctx,
+		);
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: {
+					role: "assistant",
+					content: "new branch turn",
+					stopReason: "stop",
+				},
+				toolResults: [],
+			},
+			ctx,
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(state.autoJob, null);
+		assert.equal(state.activePromise, null);
+		assert.equal(appended, false);
+		assert.equal(finalizeCalls, 0);
+	});
+
+	it("session_tree cancels queued turn-boundary work from the abandoned branch", async () => {
+		const state = createRuntimeState();
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nOld pending",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 100,
+			details: { judge: { score: 8 }, artifacts: [] },
+			expiresAt: Date.now() + 10_000,
+		});
+		let branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "old answer" }),
+			msg("u2", { role: "user", content: "future" }),
+			msg("a2", { role: "assistant", content: "future answer" }),
+		];
+		let revalidationStarted = false;
+		let revalidationFinished = false;
+		let releaseRevalidation: (() => void) | undefined;
+		const revalidationGate = new Promise<void>((resolve) => {
+			releaseRevalidation = resolve;
+		});
+		let startAutoCalls = 0;
+		const handlers: Partial<
+			Record<
+				"session_tree" | "turn_end",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "session_tree") handlers.session_tree = handler;
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+
+		registerLifecycle(pi, config(), state, {
+			runValidatedSlipstream: async () => {
+				revalidationStarted = true;
+				await revalidationGate;
+				revalidationFinished = true;
+				return {
+					mode: "validated",
+					accepted: true,
+					repaired: false,
+					artifactDir: "/tmp/slipstream-revalidation-after-tree",
+					summary: "## Goal\nRevalidated",
+					judge: {
+						score: 9,
+						decision: "accept",
+						missing: [],
+						contradictions: [],
+						diagnosis: "ok",
+					},
+					firstKeptEntryId: "a2",
+					tokensBefore: 200,
+				};
+			},
+			startAutoJob: async () => {
+				startAutoCalls += 1;
+				return null;
+			},
+		});
+		const ctx = {
+			cwd: "/repo",
+			model: { provider: "test", id: "model" },
+			modelRegistry: {
+				find: () => ({ provider: "test", id: "model" }),
+				getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+			},
+			ui: { setStatus: () => undefined, setWidget: () => undefined },
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => branch,
+			},
+			getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+			compact: () => undefined,
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		};
+		const turn = {
+			turnIndex: 2,
+			message: {
+				role: "assistant",
+				content: "future answer",
+				stopReason: "stop",
+			},
+			toolResults: [],
+		};
+
+		await handlers.turn_end?.(turn, ctx);
+		await waitUntil(() => revalidationStarted, "stale revalidation start");
+		await handlers.turn_end?.({ ...turn, turnIndex: 3 }, ctx);
+		branch = [
+			msg("u0", { role: "user", content: "rewound" }),
+			msg("rewound-head", {
+				role: "assistant",
+				content: "rewound branch head",
+			}),
+		];
+		await handlers.session_tree?.(
+			{ oldLeafId: "a2", newLeafId: "rewound-head" },
+			ctx,
+		);
+		releaseRevalidation?.();
+		await waitUntil(() => revalidationFinished, "stale revalidation finish");
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(startAutoCalls, 0);
+		assert.equal(state.compactionWanted, false);
+		assert.equal(state.autoJob, null);
+	});
+
+	it("session_tree suppresses stale turn-boundary errors after rewind", async () => {
+		const state = createRuntimeState();
+		let branch = [
+			msg("u1", { role: "user", content: "future" }),
+			msg("a1", { role: "assistant", content: "future answer" }),
+		];
+		let startAutoStarted = false;
+		let releaseStartAuto: (() => void) | undefined;
+		const startAutoGate = new Promise<void>((resolve) => {
+			releaseStartAuto = resolve;
+		});
+		const notifications: string[] = [];
+		const handlers: Partial<
+			Record<
+				"session_tree" | "turn_end",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "session_tree") handlers.session_tree = handler;
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+
+		registerLifecycle(pi, config(), state, {
+			startAutoJob: async () => {
+				startAutoStarted = true;
+				await startAutoGate;
+				throw new Error("stale abandoned-branch start");
+			},
+		});
+		const ctx = {
+			cwd: "/repo",
+			model: { provider: "test", id: "model" },
+			modelRegistry: {
+				find: () => ({ provider: "test", id: "model" }),
+				getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+			},
+			ui: {
+				notify: (message: string) => {
+					notifications.push(message);
+				},
+				setStatus: () => undefined,
+				setWidget: () => undefined,
+			},
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => branch,
+			},
+			getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+			compact: () => undefined,
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		};
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: {
+					role: "assistant",
+					content: "future answer",
+					stopReason: "stop",
+				},
+				toolResults: [],
+			},
+			ctx,
+		);
+		await waitUntil(() => startAutoStarted, "stale start auto begins");
+		branch = [
+			msg("u0", { role: "user", content: "rewound" }),
+			msg("rewound-head", {
+				role: "assistant",
+				content: "rewound branch head",
+			}),
+		];
+		await handlers.session_tree?.(
+			{ oldLeafId: "a1", newLeafId: "rewound-head" },
+			ctx,
+		);
+		releaseStartAuto?.();
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(state.status, "idle");
+		assert.deepEqual(notifications, []);
+	});
+
+	it("session_tree suppresses stale auto-start status restore after rewind", async () => {
+		const state = createRuntimeState();
+		let branch = [
+			msg("u1", { role: "user", content: "future" }),
+			msg("a1", { role: "assistant", content: "future answer" }),
+		];
+		let startAutoStarted = false;
+		let releaseStartAuto: (() => void) | undefined;
+		const startAutoGate = new Promise<void>((resolve) => {
+			releaseStartAuto = resolve;
+		});
+		const statuses: Array<string | undefined> = [];
+		const handlers: Partial<
+			Record<
+				"session_tree" | "turn_end",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "session_tree") handlers.session_tree = handler;
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+
+		registerLifecycle(pi, config(), state, {
+			startAutoJob: async () => {
+				startAutoStarted = true;
+				await startAutoGate;
+				return null;
+			},
+		});
+		const ctx = {
+			cwd: "/repo",
+			model: { provider: "test", id: "model" },
+			modelRegistry: {
+				find: () => ({ provider: "test", id: "model" }),
+				getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+			},
+			ui: {
+				setStatus: (_key: string, text: string | undefined) => {
+					statuses.push(text);
+				},
+				setWidget: () => undefined,
+			},
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => branch,
+			},
+			getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+			compact: () => undefined,
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		};
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: {
+					role: "assistant",
+					content: "future answer",
+					stopReason: "stop",
+				},
+				toolResults: [],
+			},
+			ctx,
+		);
+		await waitUntil(() => startAutoStarted, "stale start auto begins");
+		branch = [
+			msg("u0", { role: "user", content: "rewound" }),
+			msg("rewound-head", {
+				role: "assistant",
+				content: "rewound branch head",
+			}),
+		];
+		await handlers.session_tree?.(
+			{ oldLeafId: "a1", newLeafId: "rewound-head" },
+			ctx,
+		);
+		const statusCountAfterTree = statuses.length;
+		releaseStartAuto?.();
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(statuses.length, statusCountAfterTree);
+		assert.equal(state.status, "idle");
+	});
+
+	it("session_tree suppresses stale active summary callbacks after rewind", async () => {
+		const state = createRuntimeState();
+		let branch = [
+			msg("u1", { role: "user", content: "future" }),
+			msg("a1", { role: "assistant", content: "future answer" }),
+		];
+		let releaseSummary: ((summary: string) => void) | undefined;
+		const summaryPromise = new Promise<string>((resolve) => {
+			releaseSummary = resolve;
+		});
+		const statuses: Array<string | undefined> = [];
+		const handlers: Partial<
+			Record<
+				"session_tree" | "turn_end",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "session_tree") handlers.session_tree = handler;
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+
+		registerLifecycle(pi, config(), state, {
+			startAutoJob: async (input) => {
+				const job: AutoJob = {
+					sessionId: input.sessionId,
+					cwd: input.cwd,
+					projectId: input.cwd,
+					snapshot: {
+						sessionId: input.sessionId,
+						cwd: input.cwd,
+						triggerEntryId: "a1",
+						firstKeptEntryId: "u1",
+						tokensBefore: 100,
+						summaryInputMessages: [],
+						keptBoundary: { keepFromIndex: 0, firstKeptEntryId: "u1" },
+						manifest: {
+							filesRead: [],
+							filesModified: [],
+							filesDeleted: [],
+							errors: [],
+							userDecisions: [],
+							constraints: [],
+							openLoops: [],
+							recentVerification: [],
+							latestUpdates: [],
+							retainedTailUpdates: [],
+							latestExchangeState: [],
+							terminalFinalAnswerEvidence: [],
+							latestSignals: [],
+							staleSignals: [],
+							criticalLiterals: [],
+							previousSummary: null,
+							artifactRefs: [],
+							knownFileRefs: new Set<string>(),
+						},
+					},
+					firstKeptEntryId: "u1",
+					tokensBefore: 100,
+					artifactDir: "/tmp/slipstream-tree-active-summary",
+					summaryArtifactRefs: [],
+					continuation: {
+						appendTurn: () => undefined,
+						isReady: () => false,
+						snapshot: () => ({ triggerEntryId: "a1", turns: [] }),
+					},
+					summaryPromise,
+					stats: autoJobStats(),
+					finalizing: false,
+				};
+				input.state.autoJob = job;
+				input.state.activePromise = summaryPromise;
+				input.state.compactionWanted = false;
+				input.state.status = "awaiting_continuation";
+				return job;
+			},
+		});
+		const ctx = {
+			cwd: "/repo",
+			model: { provider: "test", id: "model" },
+			modelRegistry: {
+				find: () => ({ provider: "test", id: "model" }),
+				getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+			},
+			ui: {
+				setStatus: (_key: string, text: string | undefined) => {
+					statuses.push(text);
+				},
+				setWidget: () => undefined,
+			},
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => branch,
+			},
+			getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+			compact: () => undefined,
+			isIdle: () => true,
+			hasPendingMessages: () => false,
+		};
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: {
+					role: "assistant",
+					content: "future answer",
+					stopReason: "stop",
+				},
+				toolResults: [],
+			},
+			ctx,
+		);
+		await waitUntil(
+			() => state.status === "awaiting_continuation",
+			"auto start registered active summary",
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		branch = [
+			msg("u0", { role: "user", content: "rewound" }),
+			msg("rewound-head", {
+				role: "assistant",
+				content: "rewound branch head",
+			}),
+		];
+		await handlers.session_tree?.(
+			{ oldLeafId: "a1", newLeafId: "rewound-head" },
+			ctx,
+		);
+		const statusCountAfterTree = statuses.length;
+		releaseSummary?.("## Goal\nStale future summary");
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(statuses.length, statusCountAfterTree);
+		assert.equal(state.status, "idle");
+		assert.equal(state.autoJob, null);
+		assert.equal(state.activePromise, null);
+	});
+
+	it("session_tree cancels deferred idle retry for prepared adoption", async () => {
+		const state = createRuntimeState();
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nReady pending",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 100,
+			details: { judge: { score: 8 }, artifacts: [] },
+			expiresAt: Date.now() + 10_000,
+		});
+		let branch = [
+			msg("u1", { role: "user", content: "current" }),
+			msg("a1", { role: "assistant", content: "current answer" }),
+		];
+		let compactCalls = 0;
+		const handlers: Partial<
+			Record<
+				"session_tree" | "turn_end",
+				(event: unknown, ctx: unknown) => Promise<void> | void
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "session_tree") handlers.session_tree = handler;
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+
+		registerLifecycle(pi, config(), state);
+		const ctx = {
+			cwd: "/repo",
+			ui: { setStatus: () => undefined, setWidget: () => undefined },
+			sessionManager: {
+				getSessionId: () => "s1",
+				getBranch: () => branch,
+			},
+			getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+			compact: () => {
+				compactCalls += 1;
+			},
+			isIdle: () => false,
+			hasPendingMessages: () => false,
+		};
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: {
+					role: "assistant",
+					content: "current answer",
+					stopReason: "stop",
+				},
+				toolResults: [],
+			},
+			ctx,
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		branch = [
+			msg("u0", { role: "user", content: "rewound" }),
+			msg("rewound-head", {
+				role: "assistant",
+				content: "rewound branch head",
+			}),
+		];
+		await handlers.session_tree?.(
+			{ oldLeafId: "a1", newLeafId: "rewound-head" },
+			ctx,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 80));
+
+		assert.equal(compactCalls, 0);
+		assert.equal(state.pending, null);
+		assert.equal(state.status, "idle");
 	});
 });

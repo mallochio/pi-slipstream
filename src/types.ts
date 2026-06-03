@@ -291,6 +291,7 @@ export type ProgressEvent = {
 		| "rejected";
 	message: string;
 	elapsedMs?: number;
+	lastScore?: number;
 };
 
 export type ProgressSink = (event: ProgressEvent) => void;
@@ -339,6 +340,11 @@ export type RuntimeState = {
 	compactionWanted: boolean;
 	lastArtifactDir: string | null;
 	lastJudge: JudgeResult | null;
+	progressOwner: {
+		owner: symbol;
+		source: "lifecycle" | "command";
+		clear: () => void;
+	} | null;
 	status:
 		| "idle"
 		| "summarizing"

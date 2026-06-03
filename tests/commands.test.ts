@@ -22,6 +22,7 @@ import {
 import { getSlipstreamArgumentCompletions } from "../src/index.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import {
+	claimProgressOwner,
 	createRuntimeState,
 	storePendingValidated,
 } from "../src/session-state.ts";
@@ -323,6 +324,134 @@ describe("commands", () => {
 		);
 		assert.equal(statusUpdates.at(-1), "slipstream: manual");
 		assert.equal(widgetUpdates.at(-1), undefined);
+		assert.deepEqual(notifications, []);
+	});
+
+	it("command progress does not preempt active lifecycle progress", async () => {
+		const state = createRuntimeState({ now: 100 });
+		let lifecycleCleared = false;
+		const lifecycleOwner = claimProgressOwner(state, "lifecycle", () => {
+			lifecycleCleared = true;
+		});
+		const statusUpdates: Array<string | undefined> = [];
+		const widgetUpdates: Array<string[] | undefined> = [];
+		const result = await handleSlipstreamCommand(
+			"compact --dry-run",
+			state,
+			{
+				...DEFAULT_CONFIG,
+				artifactRoot: ".scratch/test-tmp/command-dry-run-active-owner",
+			},
+			{
+				cwd: process.cwd(),
+				ui: {
+					notify: () => undefined,
+					setStatus: (_key, text) => statusUpdates.push(text),
+					setWidget: (_key, lines) => widgetUpdates.push(lines),
+				},
+				sessionManager: {
+					getSessionId: () => "session-dry-run-active-owner",
+					getBranch: () => [
+						{
+							type: "message",
+							id: "u1",
+							parentId: null,
+							timestamp: "t",
+							message: { role: "user", content: "Use Slipstream" },
+						},
+						{
+							type: "message",
+							id: "a1",
+							parentId: null,
+							timestamp: "t",
+							message: { role: "assistant", content: "done" },
+						},
+					],
+				},
+			},
+			{ now: () => 100 },
+		);
+
+		assert.equal(result.ok, true);
+		assert.equal(lifecycleCleared, false);
+		assert.equal(state.progressOwner?.owner, lifecycleOwner);
+		assert.deepEqual(statusUpdates, []);
+		assert.deepEqual(widgetUpdates, []);
+	});
+
+	it("prepare command does not tick footer status during a long progress phase", async () => {
+		const state = createRuntimeState({ now: 100 });
+		const statusUpdates: Array<string | undefined> = [];
+		const widgetUpdates: Array<string[] | undefined> = [];
+		const notifications: string[] = [];
+		const result = await handleSlipstreamCommand(
+			"compact --prepare",
+			state,
+			{
+				...DEFAULT_CONFIG,
+				artifactRoot: ".scratch/test-tmp/command-progress-status-churn",
+			},
+			{
+				cwd: process.cwd(),
+				model: { provider: "test", id: "model" },
+				modelRegistry: {
+					find: () => ({ provider: "test", id: "model" }),
+					getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+				},
+				ui: {
+					notify: (message) => notifications.push(message),
+					setStatus: (_key, text) => statusUpdates.push(text),
+					setWidget: (_key, lines) => widgetUpdates.push(lines),
+				},
+				sessionManager: {
+					getSessionId: () => "session-progress-status-churn",
+					getBranch: () => [
+						{
+							type: "message",
+							id: "u1",
+							parentId: null,
+							timestamp: "t",
+							message: { role: "user", content: "Use Slipstream" },
+						},
+						{
+							type: "message",
+							id: "a1",
+							parentId: null,
+							timestamp: "t",
+							message: { role: "assistant", content: "done" },
+						},
+					],
+				},
+				getContextUsage: () => ({ tokens: 1000 }),
+			},
+			{
+				now: () => 100,
+				createSummaryCompleter: () => async () => {
+					await new Promise((resolve) => setTimeout(resolve, 1_100));
+					return "## Goal\nUse Slipstream";
+				},
+				createJudgeCompleter: () => async () => ({
+					score: 8,
+					decision: "accept",
+					missing: [],
+					contradictions: [],
+					diagnosis: "good",
+				}),
+			},
+		);
+
+		assert.equal(result.ok, true);
+		assert.equal(
+			statusUpdates.filter((text) =>
+				text?.includes("Generating candidate summary"),
+			).length,
+			1,
+		);
+		assert.ok(
+			widgetUpdates.filter((lines) => lines?.join("\n").includes("summarizing"))
+				.length >= 2,
+		);
+		assert.equal(statusUpdates.at(-1), "slipstream: pending");
 		assert.deepEqual(notifications, []);
 	});
 

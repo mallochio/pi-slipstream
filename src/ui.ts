@@ -23,7 +23,10 @@ export type SlipstreamWidgetContext = {
 };
 
 export type SlipstreamWidgetOptions = {
-	progress?: Pick<ProgressEvent, "phase" | "message" | "elapsedMs">;
+	progress?: Pick<
+		ProgressEvent,
+		"phase" | "message" | "elapsedMs" | "lastScore"
+	>;
 	model?: WidgetModel;
 };
 
@@ -37,7 +40,10 @@ export function formatElapsed(ms: number): string {
 
 function statusLabel(
 	state: RuntimeState,
-	progress?: Pick<ProgressEvent, "phase" | "message" | "elapsedMs">,
+	progress?: Pick<
+		ProgressEvent,
+		"phase" | "message" | "elapsedMs" | "lastScore"
+	>,
 ): string {
 	if (progress) {
 		if (progress.phase === "snapshot") return "snapshotting local state";
@@ -62,7 +68,10 @@ function statusLabel(
 }
 
 function elapsedLabel(
-	progress?: Pick<ProgressEvent, "phase" | "message" | "elapsedMs">,
+	progress?: Pick<
+		ProgressEvent,
+		"phase" | "message" | "elapsedMs" | "lastScore"
+	>,
 ): string | null {
 	if (typeof progress?.elapsedMs !== "number") return null;
 	if (progress.phase === "accepted" || progress.phase === "rejected")
@@ -73,9 +82,15 @@ function elapsedLabel(
 function scoreLabel(
 	state: RuntimeState,
 	label: string,
-	progress?: Pick<ProgressEvent, "phase" | "message" | "elapsedMs">,
+	progress?: Pick<
+		ProgressEvent,
+		"phase" | "message" | "elapsedMs" | "lastScore"
+	>,
 ): string | null {
-	const score = state.lastJudge?.score;
+	const score =
+		progress?.phase === "repairing"
+			? progress.lastScore
+			: state.lastJudge?.score;
 	if (typeof score !== "number") return null;
 	if (progress?.phase === "repairing") return `last score ${score}/10`;
 	if (
@@ -135,7 +150,10 @@ function ignoreStaleContextError(error: unknown): void {
 
 function shouldShowSlipstreamWidget(
 	state: RuntimeState,
-	progress?: Pick<ProgressEvent, "phase" | "message" | "elapsedMs">,
+	progress?: Pick<
+		ProgressEvent,
+		"phase" | "message" | "elapsedMs" | "lastScore"
+	>,
 ): boolean {
 	if (progress) return true;
 	return (

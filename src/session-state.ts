@@ -26,8 +26,64 @@ export function createRuntimeState(
 		compactionWanted: false,
 		lastArtifactDir: null,
 		lastJudge: null,
+		progressOwner: null,
 		status: "idle",
 	};
+}
+
+type ProgressOwnerSource = NonNullable<RuntimeState["progressOwner"]>["source"];
+
+function setProgressOwner(
+	state: RuntimeState,
+	source: ProgressOwnerSource,
+	clear: () => void,
+): symbol {
+	const owner = Symbol("slipstream-progress");
+	state.progressOwner = { owner, source, clear };
+	return owner;
+}
+
+export function clearActiveProgressOwner(state: RuntimeState): boolean {
+	const active = state.progressOwner;
+	if (!active) return false;
+	state.progressOwner = null;
+	active.clear();
+	return true;
+}
+
+export function claimProgressOwner(
+	state: RuntimeState,
+	source: ProgressOwnerSource,
+	clear: () => void,
+): symbol {
+	clearActiveProgressOwner(state);
+	return setProgressOwner(state, source, clear);
+}
+
+export function tryClaimProgressOwner(
+	state: RuntimeState,
+	source: ProgressOwnerSource,
+	clear: () => void,
+): symbol | null {
+	if (state.progressOwner) return null;
+	return setProgressOwner(state, source, clear);
+}
+
+export function ownsProgress(state: RuntimeState, owner: symbol): boolean {
+	return state.progressOwner?.owner === owner;
+}
+
+export function hasActiveProgressOwner(state: RuntimeState): boolean {
+	return state.progressOwner !== null;
+}
+
+export function releaseProgressOwner(
+	state: RuntimeState,
+	owner: symbol,
+): boolean {
+	if (!ownsProgress(state, owner)) return false;
+	state.progressOwner = null;
+	return true;
 }
 
 export function storePendingValidated(

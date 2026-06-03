@@ -104,9 +104,10 @@ describe("Slipstream widget", () => {
 					phase: "repairing",
 					message: "Repairing",
 					elapsedMs: 2_000,
+					lastScore: 3,
 				},
 			})[0],
-			"Slipstream: repairing summary · 2s · last score 4/10",
+			"Slipstream: repairing summary · 2s · last score 3/10",
 		);
 		assert.equal(
 			buildSlipstreamWidgetLines(state, DEFAULT_CONFIG, {
@@ -157,6 +158,28 @@ describe("Slipstream widget", () => {
 				},
 			),
 			["Slipstream: repairing summary"],
+		);
+	});
+
+	it("does not show stale previous judge score during repair progress", () => {
+		const state = createRuntimeState();
+		state.lastJudge = {
+			score: 9,
+			decision: "accept",
+			diagnosis: "old accepted run",
+			missing: [],
+			contradictions: [],
+		};
+
+		assert.deepEqual(
+			buildSlipstreamWidgetLines(state, DEFAULT_CONFIG, {
+				progress: {
+					phase: "repairing",
+					message: "Repairing current rejected summary",
+					lastScore: 4,
+				},
+			}),
+			["Slipstream: repairing summary · last score 4/10"],
 		);
 	});
 

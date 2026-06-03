@@ -3,6 +3,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	SessionBeforeCompactEvent,
+	SessionTreeEvent,
 	TurnEndEvent,
 } from "@mariozechner/pi-coding-agent";
 import {
@@ -31,17 +32,18 @@ import {
 } from "./pipeline.ts";
 import { createJudgeCompleter, createSummaryCompleter } from "./model.ts";
 import {
+	claimProgressOwner,
+	clearActiveProgressOwner,
 	consumePendingForCompaction,
 	createRuntimeState,
+	hasActiveProgressOwner,
+	ownsProgress,
+	releaseProgressOwner,
 	storePendingValidated,
 } from "./session-state.ts";
 import type { ProgressEvent, ProgressSink, RuntimeState } from "./types.ts";
 import type { SlipstreamConfig } from "./config.ts";
-import {
-	clearSlipstreamWidget,
-	formatElapsed,
-	updateSlipstreamWidget,
-} from "./ui.ts";
+import { clearSlipstreamWidget, updateSlipstreamWidget } from "./ui.ts";
 import type { SessionEntry } from "./types.ts";
 
 type SlipstreamContext = {
@@ -178,6 +180,7 @@ function restorePersistentStatus(
 	state: RuntimeState,
 	config: SlipstreamConfig,
 ): void {
+	if (hasActiveProgressOwner(state)) return;
 	try {
 		ctx.ui?.setStatus?.("slipstream", persistentStatusText(state));
 	} catch (error) {
@@ -194,21 +197,36 @@ function makeProgressSink(
 	state: RuntimeState,
 	config: SlipstreamConfig,
 ): ManagedProgressSink {
+	let owner: symbol;
 	let current: ProgressEvent | null = null;
 	let phaseStartedAt = Date.now();
+	let lastStatusText: string | null = null;
 	let timer: ReturnType<typeof setInterval> | null = null;
-	const clear = (): void => {
+	const stop = (): void => {
 		if (timer) clearInterval(timer);
 		timer = null;
 		current = null;
-		clearSlipstreamWidget(ctx);
+		lastStatusText = null;
 	};
+	const clear = (): void => {
+		const shouldClearWidget = releaseProgressOwner(state, owner);
+		stop();
+		if (shouldClearWidget) clearSlipstreamWidget(ctx);
+	};
+	owner = claimProgressOwner(state, "lifecycle", clear);
 	const render = (): void => {
 		if (!current) return;
+		if (!ownsProgress(state, owner)) {
+			stop();
+			return;
+		}
 		const event = { ...current, elapsedMs: Date.now() - phaseStartedAt };
-		const message = `slipstream: ${mode} ${progressStep(event.phase)} (${formatElapsed(event.elapsedMs)}) — ${event.message}`;
+		const statusText = `slipstream: ${mode} ${progressStep(event.phase)} — ${event.message}`;
 		try {
-			ctx.ui?.setStatus?.("slipstream", message);
+			if (statusText !== lastStatusText) {
+				ctx.ui?.setStatus?.("slipstream", statusText);
+				lastStatusText = statusText;
+			}
 			updateSlipstreamWidget(ctx, state, config, { progress: event });
 		} catch (error) {
 			ignoreStaleContextError(error);
@@ -518,27 +536,81 @@ export function registerLifecycle(
 	state: RuntimeState,
 	deps: {
 		finalizeAutoJob?: (input: FinalizeAutoJobInput) => Promise<boolean>;
+		startAutoJob?: typeof startAutoJob;
 		buildDefaultSlipstreamCompaction?: typeof buildDefaultSlipstreamCompaction;
 		runValidatedSlipstream?: RunValidatedSlipstream;
 	} = {},
 ): void {
 	const finalizeAuto = deps.finalizeAutoJob ?? finalizeAutoJob;
+	const startAuto = deps.startAutoJob ?? startAutoJob;
 	const buildDefaultCompaction =
 		deps.buildDefaultSlipstreamCompaction ?? buildDefaultSlipstreamCompaction;
 	const runValidated = deps.runValidatedSlipstream ?? runValidatedSlipstream;
 	let deferredIdleRetry: ReturnType<typeof setTimeout> | null = null;
 	let turnBoundaryWorkScheduled = false;
+	let turnBoundaryWorkGeneration = 0;
 	let queuedTurnBoundaryWork: {
 		event: TurnEndEvent;
 		ctx: PiContext;
 		canAdoptAtTurnBoundary: boolean;
 	} | null = null;
+	const busyIdleRetryDelayMs = 50;
 	const clearDeferredIdleRetry = (): void => {
 		if (deferredIdleRetry === null) return;
 		clearTimeout(deferredIdleRetry);
 		deferredIdleRetry = null;
 	};
-	const scheduleDeferredIdleRetry = (ctx: PiContext): void => {
+	const clearMismatchedAutoJob = (sessionId: string, cwd: string): boolean => {
+		const job = state.autoJob;
+		if (!job || (job.sessionId === sessionId && job.cwd === cwd)) return false;
+		if (state.activePromise === job.summaryPromise) state.activePromise = null;
+		state.autoJob = null;
+		state.status = state.pending ? "ready_to_adopt" : "idle";
+		return true;
+	};
+	const cancelTurnBoundaryWork = (): void => {
+		turnBoundaryWorkGeneration += 1;
+		turnBoundaryWorkScheduled = false;
+		queuedTurnBoundaryWork = null;
+	};
+	const handleTreeNavigation = (ctx: PiContext): void => {
+		clearDeferredIdleRetry();
+		cancelTurnBoundaryWork();
+		clearActiveProgressOwner(state);
+		state.activePromise = null;
+		state.autoJob = null;
+		state.compactionWanted = false;
+
+		let sessionId = "unknown";
+		let cwd = ".";
+		let validatedThroughEntryId: string | null = null;
+		try {
+			sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+			cwd = ctx.cwd;
+			validatedThroughEntryId = currentValidatedThroughEntryId(ctx, config);
+		} catch (error) {
+			ignoreStaleContextError(error);
+			state.pending = null;
+			state.status = "idle";
+			clearSlipstreamWidget(ctx);
+			restorePersistentStatus(ctx, state, config);
+			return;
+		}
+
+		const pending = state.pending;
+		if (
+			pending &&
+			(pending.sessionId !== sessionId ||
+				pending.cwd !== cwd ||
+				pending.validatedThroughEntryId !== validatedThroughEntryId ||
+				Date.now() > pending.expiresAt)
+		) {
+			state.pending = null;
+		}
+		state.status = state.pending ? "ready_to_adopt" : "idle";
+		restorePersistentStatus(ctx, state, config);
+	};
+	const scheduleDeferredIdleRetry = (ctx: PiContext, delayMs = 0): void => {
 		if (deferredIdleRetry !== null) return;
 		let sessionId = "unknown";
 		let cwd = ".";
@@ -554,16 +626,39 @@ export function registerLifecycle(
 				deferredIdleRetry = null;
 				if (ctx.sessionManager.getSessionId?.() !== sessionId) return;
 				if (ctx.cwd !== cwd) return;
+				if (clearMismatchedAutoJob(sessionId, cwd)) return;
+				const readyForIdleWork = shouldTriggerPreparedCompactionNow(
+					runtimeReadiness(ctx),
+				);
+				if (state.autoJob) {
+					if (!readyForIdleWork) {
+						scheduleDeferredIdleRetry(ctx, busyIdleRetryDelayMs);
+						return;
+					}
+					void finalizeAutoAtSafeBoundary(ctx, {
+						allowIncompleteContinuation: true,
+						requireIdleBeforeFinalize: true,
+					}).catch(ignoreStaleContextError);
+					return;
+				}
+				if (!readyForIdleWork) {
+					if (state.pending && state.status === "ready_to_adopt")
+						scheduleDeferredIdleRetry(ctx, busyIdleRetryDelayMs);
+					return;
+				}
 				void tryAdoptAtSafeBoundary(ctx, { allowDeferredRetry: false }).catch(
 					ignoreStaleContextError,
 				);
 			} catch (error) {
 				ignoreStaleContextError(error);
 			}
-		}, 0);
+		}, delayMs);
 		deferredIdleRetry.unref?.();
 	};
-	const startAutoAtStableBoundary = async (ctx: PiContext): Promise<void> => {
+	const startAutoAtStableBoundary = async (
+		ctx: PiContext,
+		isCancelled: () => boolean = () => false,
+	): Promise<void> => {
 		let sessionId = "unknown";
 		let cwd = ".";
 		try {
@@ -573,8 +668,9 @@ export function registerLifecycle(
 			ignoreStaleContextError(error);
 			return;
 		}
+		if (isCancelled()) return;
 		const branch = safeBranchEntries(ctx);
-		if (!branch) return;
+		if (!branch || isCancelled()) return;
 		if (
 			!ctx.modelRegistry ||
 			!shouldStartAutoJob(config, state, ctx.getContextUsage?.(), {
@@ -588,9 +684,10 @@ export function registerLifecycle(
 			})
 		)
 			return;
+		if (isCancelled()) return;
 		const progress = makeProgressSink(ctx, "auto", state, config);
 		try {
-			await startAutoJob({
+			await startAuto({
 				state,
 				config,
 				branchEntries: branch,
@@ -607,6 +704,7 @@ export function registerLifecycle(
 				signal: ctx.signal,
 				isCurrent: () => {
 					try {
+						if (isCancelled()) return false;
 						const currentBranch = safeBranchEntries(ctx);
 						return (
 							currentBranch !== null &&
@@ -626,21 +724,27 @@ export function registerLifecycle(
 				},
 			});
 		} finally {
+			if (isCancelled()) return;
 			const activeSummary = state.activePromise;
 			if (activeSummary) {
 				void activeSummary.then(
 					() => {
+						if (isCancelled()) return;
 						progress.clear();
 						restorePersistentStatus(ctx, state, config);
+						scheduleDeferredIdleRetry(ctx);
 					},
 					() => {
+						if (isCancelled()) return;
 						progress.clear();
 						restorePersistentStatus(ctx, state, config);
+						scheduleDeferredIdleRetry(ctx);
 					},
 				);
 			} else {
 				progress.clear();
 				restorePersistentStatus(ctx, state, config);
+				scheduleDeferredIdleRetry(ctx);
 			}
 		}
 	};
@@ -728,6 +832,73 @@ export function registerLifecycle(
 		restorePersistentStatus(ctx, state, config);
 		return false;
 	};
+	const finalizeAutoAtSafeBoundary = async (
+		ctx: PiContext,
+		options: {
+			allowIncompleteContinuation?: boolean;
+			requireIdleBeforeFinalize?: boolean;
+			canAdopt?: boolean;
+		} = {},
+	): Promise<boolean> => {
+		if (!state.autoJob || !ctx.modelRegistry) return false;
+		let sessionId = "unknown";
+		let cwd = ".";
+		try {
+			sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+			cwd = ctx.cwd;
+		} catch (error) {
+			ignoreStaleContextError(error);
+			return false;
+		}
+		if (clearMismatchedAutoJob(sessionId, cwd)) return false;
+		if (
+			options.requireIdleBeforeFinalize &&
+			!shouldTriggerPreparedCompactionNow(runtimeReadiness(ctx))
+		)
+			return false;
+		const branch = safeBranchEntries(ctx);
+		if (!branch) return false;
+		const progress = makeProgressSink(ctx, "auto", state, config);
+		const finalizeInput = {
+			state,
+			config,
+			completeSummary: createSummaryCompleter(
+				{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+				config.summaryModel,
+			),
+			completeJudge: createJudgeCompleter(
+				{ model: ctx.model, modelRegistry: ctx.modelRegistry },
+				config.judgeModel,
+			),
+			now: () => Date.now(),
+			validatedThroughEntryId: validatedThroughEntryIdFromBranch(
+				branch,
+				config,
+			),
+			allowIncompleteContinuation: options.allowIncompleteContinuation,
+			onProgress: progress,
+			signal: ctx.signal,
+		};
+		try {
+			const accepted = await finalizeAuto(finalizeInput);
+			progress.clear();
+			restorePersistentStatus(ctx, state, config);
+			if (accepted && options.canAdopt !== false)
+				await tryAdoptAtSafeBoundary(ctx);
+			return accepted;
+		} catch (error) {
+			progress.clear();
+			state.status = "failed";
+			restorePersistentStatus(ctx, state, config);
+			const message = error instanceof Error ? error.message : String(error);
+			safeNotify(
+				ctx,
+				`Slipstream auto finalize failed; compaction cancelled: ${message}`,
+				"error",
+			);
+			return false;
+		}
+	};
 	const scheduleTurnBoundaryWork = (
 		event: TurnEndEvent,
 		ctx: PiContext,
@@ -738,15 +909,22 @@ export function registerLifecycle(
 			return;
 		}
 		turnBoundaryWorkScheduled = true;
+		const generation = turnBoundaryWorkGeneration;
 		void (async () => {
 			try {
+				if (generation !== turnBoundaryWorkGeneration) return;
 				const adoptionRequested = canAdoptAtTurnBoundary
 					? await tryAdoptAtSafeBoundary(ctx)
 					: false;
+				if (generation !== turnBoundaryWorkGeneration) return;
 				if (adoptionRequested || state.status === "summarizing") return;
 				if (!isAutoTriggerBoundary(event.message)) return;
-				await startAutoAtStableBoundary(ctx);
+				await startAutoAtStableBoundary(
+					ctx,
+					() => generation !== turnBoundaryWorkGeneration,
+				);
 			} catch (error) {
+				if (generation !== turnBoundaryWorkGeneration) return;
 				try {
 					ignoreStaleContextError(error);
 				} catch (nonStaleError) {
@@ -763,6 +941,7 @@ export function registerLifecycle(
 					);
 				}
 			} finally {
+				if (generation !== turnBoundaryWorkGeneration) return;
 				turnBoundaryWorkScheduled = false;
 				const queued = queuedTurnBoundaryWork;
 				queuedTurnBoundaryWork = null;
@@ -812,6 +991,7 @@ export function registerLifecycle(
 		const ctx = rawCtx as PiContext;
 		clearDeferredIdleRetry();
 		queuedTurnBoundaryWork = null;
+		clearActiveProgressOwner(state);
 		clearSlipstreamWidget(ctx);
 		state.activePromise = null;
 		state.autoJob = null;
@@ -820,58 +1000,40 @@ export function registerLifecycle(
 		state.status = "idle";
 	});
 
+	pi.on("session_tree", async (_rawEvent: SessionTreeEvent, rawCtx) => {
+		const ctx = rawCtx as PiContext;
+		if (!config.enabled) return;
+		try {
+			handleTreeNavigation(ctx);
+		} catch (error) {
+			ignoreStaleContextError(error);
+		}
+	});
+
 	pi.on("turn_end", async (rawEvent, rawCtx) => {
 		const event = rawEvent as TurnEndEvent;
 		const ctx = rawCtx as PiContext;
 		if (!config.enabled) return;
 		const canAdoptAtTurnBoundary = !isIncompleteAssistantTurn(event);
 		if (state.autoJob) {
-			state.autoJob.continuation.appendTurn(event);
-			if (state.autoJob.continuation.isReady() && ctx.modelRegistry) {
-				const branch = safeBranchEntries(ctx);
-				if (!branch) return;
-				const validatedThroughEntryId = validatedThroughEntryIdFromBranch(
-					branch,
-					config,
-				);
-				const progress = makeProgressSink(ctx, "auto", state, config);
-				const finalizeInput = {
-					state,
-					config,
-					completeSummary: createSummaryCompleter(
-						{ model: ctx.model, modelRegistry: ctx.modelRegistry },
-						config.summaryModel,
-					),
-					completeJudge: createJudgeCompleter(
-						{ model: ctx.model, modelRegistry: ctx.modelRegistry },
-						config.judgeModel,
-					),
-					now: () => Date.now(),
-					validatedThroughEntryId,
-					onProgress: progress,
-					signal: ctx.signal,
-				};
-				const handleFinalizeError = (error: unknown) => {
-					progress.clear();
-					state.status = "failed";
-					restorePersistentStatus(ctx, state, config);
-					const message =
-						error instanceof Error ? error.message : String(error);
-					safeNotify(
-						ctx,
-						`Slipstream auto finalize failed; compaction cancelled: ${message}`,
-						"error",
-					);
-				};
-				void finalizeAuto(finalizeInput)
-					.then(async (accepted) => {
-						progress.clear();
-						restorePersistentStatus(ctx, state, config);
-						if (accepted && canAdoptAtTurnBoundary)
-							await tryAdoptAtSafeBoundary(ctx);
-					})
-					.catch(handleFinalizeError);
+			let sessionId = "unknown";
+			let cwd = ".";
+			try {
+				sessionId = ctx.sessionManager.getSessionId?.() ?? "unknown";
+				cwd = ctx.cwd;
+			} catch (error) {
+				ignoreStaleContextError(error);
+				return;
 			}
+			if (clearMismatchedAutoJob(sessionId, cwd)) {
+				scheduleTurnBoundaryWork(event, ctx, canAdoptAtTurnBoundary);
+				return;
+			}
+			state.autoJob.continuation.appendTurn(event);
+			if (state.autoJob.continuation.isReady() && ctx.modelRegistry)
+				void finalizeAutoAtSafeBoundary(ctx, {
+					canAdopt: canAdoptAtTurnBoundary,
+				});
 			return;
 		}
 
@@ -882,6 +1044,7 @@ export function registerLifecycle(
 		const ctx = rawCtx as PiContext;
 		if (!config.enabled) return;
 		clearDeferredIdleRetry();
+		clearActiveProgressOwner(state);
 		state.activePromise = null;
 		state.autoJob = null;
 		if (state.pending) await clearPendingArtifact(state.pending);

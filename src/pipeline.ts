@@ -375,6 +375,7 @@ export async function runValidatedSlipstream(
 		input.onProgress?.({
 			phase: "repairing",
 			message: `Repair attempt ${attempt + 1}/${repairAttempts}`,
+			lastScore: judge.score,
 		});
 		await yieldBeforeHeavyCompactionWork();
 		const repairedSummary = await input.completeSummary(
@@ -391,6 +392,7 @@ export async function runValidatedSlipstream(
 				phase: "repairing",
 				message:
 					"Slipstream repair returned an empty or heading-only summary; retaining the previous substantive candidate and trying remaining repairs.",
+				lastScore: judge.score,
 			});
 			continue;
 		}

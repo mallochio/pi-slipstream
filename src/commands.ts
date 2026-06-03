@@ -29,7 +29,11 @@ import {
 } from "./pipeline.ts";
 import {
 	adoptPending,
+	hasActiveProgressOwner,
+	ownsProgress,
+	releaseProgressOwner,
 	storePendingValidated,
+	tryClaimProgressOwner,
 	type CompactCapableContext,
 } from "./session-state.ts";
 import type {
@@ -42,7 +46,7 @@ import type {
 	RuntimeState,
 	SessionEntry,
 } from "./types.ts";
-import { formatElapsed, updateSlipstreamWidget } from "./ui.ts";
+import { updateSlipstreamWidget } from "./ui.ts";
 
 export type CommandResult = { ok: boolean; message: string };
 export type CommandDeps = {
@@ -85,21 +89,41 @@ function makeProgressSink(
 	state: RuntimeState,
 	config: SlipstreamConfig,
 ): ManagedProgressSink {
+	let owner: symbol | null = null;
 	let current: ProgressEvent | null = null;
 	let phaseStartedAt = Date.now();
+	let lastStatusText: string | null = null;
 	let timer: ReturnType<typeof setInterval> | null = null;
-	const clear = (): void => {
+	const stop = (): void => {
 		if (timer) clearInterval(timer);
 		timer = null;
+		current = null;
+		lastStatusText = null;
 	};
+	const clear = (): void => {
+		if (owner) releaseProgressOwner(state, owner);
+		stop();
+	};
+	owner = tryClaimProgressOwner(state, "command", clear);
+	if (!owner) {
+		const noop = ((_event: ProgressEvent): void =>
+			undefined) as ManagedProgressSink;
+		noop.clear = () => undefined;
+		return noop;
+	}
 	const render = (): void => {
 		if (!current) return;
+		if (!owner || !ownsProgress(state, owner)) {
+			stop();
+			return;
+		}
 		const event = { ...current, elapsedMs: Date.now() - phaseStartedAt };
+		const statusText = `Slipstream: ${event.message}`;
 		try {
-			ctx.ui?.setStatus?.(
-				"slipstream",
-				`Slipstream: ${event.message} (${formatElapsed(event.elapsedMs)})`,
-			);
+			if (statusText !== lastStatusText) {
+				ctx.ui?.setStatus?.("slipstream", statusText);
+				lastStatusText = statusText;
+			}
 			updateSlipstreamWidget(ctx, state, config, { progress: event });
 		} catch (error) {
 			ignoreStaleContextError(error);
@@ -136,6 +160,7 @@ function restorePersistentStatus(
 	state: RuntimeState,
 	config: SlipstreamConfig,
 ): void {
+	if (hasActiveProgressOwner(state)) return;
 	try {
 		ctx.ui?.setStatus?.("slipstream", persistentStatusText(state));
 		updateSlipstreamWidget(ctx, state, config);
