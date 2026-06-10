@@ -24,6 +24,8 @@ export function createRuntimeState(
 		autoJob: null,
 		activePromise: null,
 		compactionWanted: false,
+		nextSlipstreamCompactionRequestId: 0,
+		slipstreamCompactionRequest: null,
 		lastArtifactDir: null,
 		lastJudge: null,
 		progressOwner: null,
@@ -149,6 +151,42 @@ export function consumePendingForCompaction(
 	};
 }
 
+export function requestSlipstreamCompaction(
+	state: RuntimeState,
+): NonNullable<RuntimeState["slipstreamCompactionRequest"]> {
+	const request = {
+		id: state.nextSlipstreamCompactionRequestId + 1,
+		expiresAt: Math.min(
+			state.pending?.expiresAt ?? Number.POSITIVE_INFINITY,
+			Date.now() + 30_000,
+		),
+	};
+	state.nextSlipstreamCompactionRequestId = request.id;
+	state.slipstreamCompactionRequest = request;
+	return request;
+}
+
+export function activeSlipstreamCompactionRequest(
+	state: RuntimeState,
+	now: number = Date.now(),
+): NonNullable<RuntimeState["slipstreamCompactionRequest"]> | null {
+	const request = state.slipstreamCompactionRequest;
+	if (!request) return null;
+	if (now > request.expiresAt) {
+		state.slipstreamCompactionRequest = null;
+		return null;
+	}
+	return request;
+}
+
+export function clearSlipstreamCompactionRequest(
+	state: RuntimeState,
+	request?: NonNullable<RuntimeState["slipstreamCompactionRequest"]>,
+): void {
+	if (!request || state.slipstreamCompactionRequest?.id === request.id)
+		state.slipstreamCompactionRequest = null;
+}
+
 export function adoptPending(
 	state: RuntimeState,
 	ctx: CompactCapableContext,
@@ -172,18 +210,22 @@ export function adoptPending(
 		return null;
 	}
 	state.status = "summarizing";
+	const request = requestSlipstreamCompaction(state);
 	try {
 		ctx.compact({
 			customInstructions:
 				"Use validated Slipstream summary from pi-slipstream-compact",
 			onComplete: () => {
+				clearSlipstreamCompactionRequest(state, request);
 				state.status = "idle";
 			},
 			onError: () => {
+				clearSlipstreamCompactionRequest(state, request);
 				state.status = state.pending ? "ready_to_adopt" : "idle";
 			},
 		});
 	} catch (error) {
+		clearSlipstreamCompactionRequest(state, request);
 		state.status = "ready_to_adopt";
 		throw error;
 	}

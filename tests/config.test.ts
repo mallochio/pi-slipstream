@@ -15,6 +15,7 @@ describe("config", () => {
 	it("keeps auto-enabled direct defaults", () => {
 		assert.equal(DEFAULT_CONFIG.enabled, true);
 		assert.equal(DEFAULT_CONFIG.autoTrigger, true);
+		assert.equal(DEFAULT_CONFIG.replaceDefaultCompact, true);
 		assert.equal(DEFAULT_CONFIG.triggerContextPercent, 0.6);
 		assert.equal(DEFAULT_CONFIG.softContextPercent, 0.6);
 		assert.equal(DEFAULT_CONFIG.hardContextPercent, 0.6);
@@ -29,7 +30,8 @@ describe("config", () => {
 	it("normalizes valid user overrides without mutating defaults", () => {
 		const cfg = normalizeConfig({
 			enabled: false,
-			autoTrigger: true,
+			autoTrigger: false,
+			replaceDefaultCompact: false,
 			triggerContextPercent: 0.7,
 			softContextPercent: 0.74,
 			hardContextPercent: 0.91,
@@ -48,7 +50,17 @@ describe("config", () => {
 		});
 
 		assert.equal(cfg.enabled, false);
-		assert.equal(cfg.autoTrigger, true);
+		assert.equal(cfg.autoTrigger, false);
+		assert.equal(cfg.replaceDefaultCompact, false);
+		assert.equal(
+			normalizeConfig({ replaceDefaultCompact: false }).autoTrigger,
+			false,
+		);
+		assert.equal(
+			normalizeConfig({ replaceDefaultCompact: false, autoTrigger: true })
+				.autoTrigger,
+			false,
+		);
 		assert.equal(cfg.triggerContextPercent, 0.7);
 		assert.equal(cfg.softContextPercent, 0.74);
 		assert.equal(cfg.hardContextPercent, 0.91);

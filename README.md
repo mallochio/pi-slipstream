@@ -38,13 +38,14 @@ This package can start background model calls near context limits and can send s
 
 After installing, keep using Pi normally.
 
-| You want                                      | Do this                                                                                                        |
-| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Let compaction happen automatically           | Nothing. Background preparation is enabled by default and starts when the session gets large.                  |
-| Compact manually                              | Run `/compact`.                                                                                                |
-| See Slipstream state                          | Watch the compact widget above the prompt while Slipstream is active, or run `/slipstream status` for details. |
-| Find recovery artifacts                       | Run `/slipstream artifacts`.                                                                                   |
-| Turn off background preparation while testing | Set `autoTrigger: false`; `/compact` still uses Slipstream while the package is enabled.                       |
+| You want                                              | Do this                                                                                                        |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Let compaction happen automatically                   | Nothing. Background preparation is enabled by default and starts when the session gets large.                  |
+| Compact manually                                      | Run `/compact`.                                                                                                |
+| See Slipstream state                                  | Watch the compact widget above the prompt while Slipstream is active, or run `/slipstream status` for details. |
+| Find recovery artifacts                               | Run `/slipstream artifacts`.                                                                                   |
+| Turn off background preparation while testing         | Set `autoTrigger: false`; `/compact` still uses Slipstream while the package is enabled.                       |
+| Keep another extension or native Pi owning `/compact` | Set `replaceDefaultCompact: false`; use `/slipstream compact` only when you explicitly want Slipstream.        |
 
 Before using it on a real repository, make sure `.scratch/` is gitignored. Slipstream writes local recovery artifacts under `.scratch/compactions`.
 
@@ -68,6 +69,7 @@ Important defaults:
 | ----------------------- | ---------------------: | ------------------------------------------------------------------------------------------------- |
 | `enabled`               |                 `true` | Enables background preparation and `/compact` replacement. Support commands remain available.     |
 | `autoTrigger`           |                 `true` | Starts preparing a checked summary in the background when the session gets large.                 |
+| `replaceDefaultCompact` |                 `true` | Makes plain `/compact` use Slipstream by default; set `false` for side-by-side mode.              |
 | `triggerContextPercent` |                  `0.6` | Starts/latches auto compaction around 60% context usage.                                          |
 | `judgeThreshold`        |                    `7` | Minimum continuation-quality score before normal acceptance.                                      |
 | `repairAttempts`        |                    `3` | Tries full-summary repair after judge rejection.                                                  |
@@ -293,6 +295,18 @@ Disable background preparation:
 
 This disables background preparation only. Plain `/compact` still uses Slipstream while the package is enabled.
 
+Run side-by-side with native Pi or another extension owning plain `/compact`:
+
+```json
+{
+	"pi-slipstream-compact": {
+		"replaceDefaultCompact": false
+	}
+}
+```
+
+This also disables Slipstream auto-triggering. Explicit `/slipstream compact`, `/slipstream compact --prepare`, and `/slipstream compact --adopt` remain available. If you set `replaceDefaultCompact: false`, `autoTrigger` is normalized to `false` even when configured as `true`.
+
 Disable Slipstream compaction replacement entirely:
 
 ```json
@@ -328,7 +342,8 @@ Tuned local configuration example:
 | Setting                 |                Default | Meaning                                                                                                                                                                                                                                                                                                                                        |
 | ----------------------- | ---------------------: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`               |                 `true` | Enables lifecycle hooks and `/compact` replacement. `/slipstream` support commands remain registered even when disabled.                                                                                                                                                                                                                       |
-| `autoTrigger`           |                 `true` | Starts background summary preparation near context pressure. Set `false` to disable background preparation.                                                                                                                                                                                                                                    |
+| `autoTrigger`           |                 `true` | Starts background summary preparation near context pressure. Set `false` to disable background preparation. Forced off when `replaceDefaultCompact` is `false`, including when explicitly configured as `true`.                                                                                                                                |
+| `replaceDefaultCompact` |                 `true` | When `true`, plain Pi `/compact` and threshold compaction use Slipstream. When `false`, plain/default compaction is left to Pi or another extension, while explicit `/slipstream compact` and `--adopt` still use Slipstream.                                                                                                                  |
 | `triggerContextPercent` |                  `0.6` | Single context-pressure threshold for starting background preparation and latching compaction urgency. Fresh validated summaries compact when Pi reports the session is idle; stale summaries are revalidated before adoption. Legacy `softContextPercent`/`hardContextPercent` are accepted as aliases but should not be used for new config. |
 | `minContinuationTurns`  |                    `1` | Preferred continuation turns before turn-boundary auto validation. If Pi is already idle after the background summary resolves, auto finalization may proceed with fewer turns instead of waiting forever.                                                                                                                                     |
 | `maxContinuationTurns`  |                    `4` | Maximum continuation turns collected for auto validation when later turns arrive.                                                                                                                                                                                                                                                              |
@@ -358,14 +373,40 @@ Optional model override example:
 
 The extension registers one command namespace and a small set of lifecycle handlers:
 
-| Pi surface                           | Package behavior                                                                                                                                                                                                                                                                                                |
-| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `registerCommand("slipstream", ...)` | Provides `/slipstream status`, `artifacts`, one-command `compact`, `compact --dry-run`, `compact --prepare`, and `compact --adopt`.                                                                                                                                                                             |
-| `turn_end`                           | At `triggerContextPercent`, starts candidate generation after final assistant responses, latches compaction urgency, collects continuation evidence when later turns arrive, revalidates stale pending summaries against the live branch head, and activates only fresh pending summaries with `ctx.compact()`. |
-| `session_before_compact`             | Uses a current prepared pending summary if available; otherwise generates, judges, and returns a fresh Slipstream summary as the default compaction replacement.                                                                                                                                                |
-| `session_start` / `session_shutdown` | Keeps the compact widget hidden while idle, clears it on shutdown, updates lightweight status, and clears in-memory background state.                                                                                                                                                                           |
+| Pi surface                           | Package behavior                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `registerCommand("slipstream", ...)` | Provides `/slipstream status`, `artifacts`, one-command `compact`, `compact --dry-run`, `compact --prepare`, and `compact --adopt`.                                                                                                                                                                                                       |
+| `turn_end`                           | At `triggerContextPercent`, starts candidate generation after final assistant responses, latches compaction urgency, collects continuation evidence when later turns arrive, revalidates stale pending summaries against the live branch head, and activates only fresh pending summaries with `ctx.compact()`.                           |
+| `session_before_compact`             | Uses a current Slipstream-requested pending summary if available; otherwise generates, judges, and returns a fresh Slipstream summary as the default compaction replacement. With `replaceDefaultCompact: false`, plain/default compaction returns to Pi or another extension unless `/slipstream compact` explicitly requested adoption. |
+| `session_start` / `session_shutdown` | Keeps the compact widget hidden while idle, clears it on shutdown, updates lightweight status, and clears in-memory background state.                                                                                                                                                                                                     |
 
-The normal manual path is now plain Pi `/compact` or `/slipstream compact`. The automatic path uses one threshold: begin preparing at `triggerContextPercent`, keep collecting continuation evidence when it arrives, and compact only when the pending summary is validated through the current branch head and Pi reports an idle runtime with no queued messages. If no later turn arrives after the background summary resolves, Slipstream can still proceed through finalizing, judging, repair, pending-summary creation, and idle adoption instead of waiting forever. If the auto pending summary is stale, Slipstream revalidates it with a fresh retained-tail boundary instead of blocking on old work, adopting stale state, or keeping an old oversized tail. If timing still reaches Pi's own model-limit compaction, Slipstream generates/judges directly in `session_before_compact`. The expert prepare/adopt split still exists when you want to inspect a validated pending summary before applying it.
+The normal manual path is plain Pi `/compact` or `/slipstream compact` when `replaceDefaultCompact` is enabled, and explicit `/slipstream compact` only when side-by-side mode is enabled. The automatic path uses one threshold: begin preparing at `triggerContextPercent`, keep collecting continuation evidence when it arrives, and compact only when the pending summary is validated through the current branch head and Pi reports an idle runtime with no queued messages. If no later turn arrives after the background summary resolves, Slipstream can still proceed through finalizing, judging, repair, pending-summary creation, and idle adoption instead of waiting forever. If the auto pending summary is stale, Slipstream revalidates it with a fresh retained-tail boundary instead of blocking on old work, adopting stale state, or keeping an old oversized tail. If timing still reaches Pi's own model-limit compaction, Slipstream generates/judges directly in `session_before_compact` unless `replaceDefaultCompact` is disabled. The expert prepare/adopt split still exists when you want to inspect a validated pending summary before applying it.
+
+## Integration API
+
+Other extensions can reuse Slipstream-style validation without installing Slipstream as the default `/compact` owner:
+
+```ts
+import { slipstreamStyleValidateAndRepair } from "pi-slipstream-compact/integration-api";
+
+const result = await slipstreamStyleValidateAndRepair({
+	candidate,
+	sourceEvidence: {
+		sourceMessageExcerpts,
+		filesModified,
+		unresolvedErrors,
+		userDecisions,
+		constraints,
+	},
+	continuation,
+	completeText,
+	config: { judgeThreshold: 7, repairAttempts: 1 },
+});
+```
+
+The integration API is deliberately narrower than the full extension lifecycle. It judges and optionally repairs a caller-provided candidate summary using caller-provided evidence and a caller-provided `completeText` function. It does not call `ctx.compact()`, register commands, manage pending state, update widgets, write local artifacts, or write central stats. The result includes the final `summary`, `accepted`, `repaired`, `repairCount`, top-level score/diagnostics, and the underlying `JudgeResult`.
+
+Use this when another extension already owns candidate generation and wants a Slipstream-style quality gate. Use the full package lifecycle when you want Slipstream to own candidate generation, evidence collection, repair, freshness checks, artifacts, and adoption.
 
 ## Progress visibility
 

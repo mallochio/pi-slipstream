@@ -13,6 +13,11 @@
 		"url": "https://github.com/OrestesK/pi-slipstream-compact/issues"
 	},
 	"homepage": "https://github.com/OrestesK/pi-slipstream-compact#readme",
+	"exports": {
+		".": "./src/index.ts",
+		"./integration-api": "./src/integration-api.ts",
+		"./package.json": "./package.json"
+	},
 	"publishConfig": {
 		"access": "public"
 	},

@@ -37,8 +37,11 @@ import {
 	consumePendingForCompaction,
 	createRuntimeState,
 	hasActiveProgressOwner,
+	activeSlipstreamCompactionRequest,
+	clearSlipstreamCompactionRequest,
 	ownsProgress,
 	releaseProgressOwner,
+	requestSlipstreamCompaction,
 	storePendingValidated,
 } from "./session-state.ts";
 import type { ProgressEvent, ProgressSink, RuntimeState } from "./types.ts";
@@ -385,21 +388,25 @@ function triggerPreparedCompaction(
 	try {
 		if (!ctx.compact) return;
 		state.status = "summarizing";
+		const request = requestSlipstreamCompaction(state);
 		ctx.ui?.setStatus?.("slipstream", "slipstream: adopting");
 		updateSlipstreamWidget(ctx, state, config);
 		ctx.compact({
 			customInstructions:
 				"Use validated Slipstream summary from pi-slipstream-compact",
 			onComplete: () => {
+				clearSlipstreamCompactionRequest(state, request);
 				state.status = "idle";
 				restorePersistentStatus(ctx, state, config);
 			},
 			onError: () => {
+				clearSlipstreamCompactionRequest(state, request);
 				state.status = state.pending ? "ready_to_adopt" : "idle";
 				restorePersistentStatus(ctx, state, config);
 			},
 		});
 	} catch (error) {
+		clearSlipstreamCompactionRequest(state);
 		state.status = state.pending ? "ready_to_adopt" : "idle";
 		ignoreStaleContextError(error);
 	}
@@ -580,6 +587,7 @@ export function registerLifecycle(
 		state.activePromise = null;
 		state.autoJob = null;
 		state.compactionWanted = false;
+		clearSlipstreamCompactionRequest(state);
 
 		let sessionId = "unknown";
 		let cwd = ".";
@@ -997,6 +1005,7 @@ export function registerLifecycle(
 		state.autoJob = null;
 		state.pending = null;
 		state.compactionWanted = false;
+		clearSlipstreamCompactionRequest(state);
 		state.status = "idle";
 	});
 
@@ -1047,6 +1056,7 @@ export function registerLifecycle(
 		clearActiveProgressOwner(state);
 		state.activePromise = null;
 		state.autoJob = null;
+		clearSlipstreamCompactionRequest(state);
 		if (state.pending) await clearPendingArtifact(state.pending);
 		state.pending = null;
 		state.compactionWanted = false;
@@ -1071,17 +1081,33 @@ export function registerLifecycle(
 			return undefined;
 		}
 		const pendingBeforeConsume = state.pending;
-		const consumed = consumePendingForCompaction(state, {
-			sessionId,
-			cwd,
-			preparationFirstKeptEntryId: event.preparation.firstKeptEntryId,
-			validatedThroughEntryId: buildContinuationFromBranch(
-				branchEntries,
-				config.maxContinuationTurns,
-			).triggerEntryId,
-			now: Date.now(),
-		});
+		const now = Date.now();
+		const requestedCompaction = state.slipstreamCompactionRequest;
+		const explicitRequest = activeSlipstreamCompactionRequest(state, now);
+		if (requestedCompaction && !explicitRequest) {
+			clearSlipstreamCompactionRequest(state, requestedCompaction);
+			if (pendingBeforeConsume)
+				await clearPendingArtifact(pendingBeforeConsume);
+			state.pending = null;
+			state.status = "idle";
+			restorePersistentStatus(ctx, state, config);
+			return { cancel: true };
+		}
+		const shouldHandlePending = config.replaceDefaultCompact || explicitRequest;
+		const consumed = shouldHandlePending
+			? consumePendingForCompaction(state, {
+					sessionId,
+					cwd,
+					preparationFirstKeptEntryId: event.preparation.firstKeptEntryId,
+					validatedThroughEntryId: buildContinuationFromBranch(
+						branchEntries,
+						config.maxContinuationTurns,
+					).triggerEntryId,
+					now,
+				})
+			: undefined;
 		if (consumed) {
+			clearSlipstreamCompactionRequest(state, explicitRequest ?? undefined);
 			clearDeferredIdleRetry();
 			if (pendingBeforeConsume)
 				await clearPendingArtifact(pendingBeforeConsume);
@@ -1101,6 +1127,17 @@ export function registerLifecycle(
 					tokensBefore: event.preparation.tokensBefore,
 				},
 			};
+		}
+		if (explicitRequest) {
+			clearSlipstreamCompactionRequest(state, explicitRequest);
+			if (pendingBeforeConsume)
+				await clearPendingArtifact(pendingBeforeConsume);
+			restorePersistentStatus(ctx, state, config);
+			return { cancel: true };
+		}
+		if (!config.replaceDefaultCompact) {
+			restorePersistentStatus(ctx, state, config);
+			return undefined;
 		}
 		try {
 			ctx.ui?.setStatus?.("slipstream", "slipstream: /compact starting");

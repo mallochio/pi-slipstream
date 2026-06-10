@@ -139,7 +139,9 @@ describe("continuation buffer", () => {
 					timestamp: "t",
 					message: {
 						role: "assistant",
-						content: [{ type: "toolCall", id: "call", name: "read", input: {} }],
+						content: [
+							{ type: "toolCall", id: "call", name: "read", input: {} },
+						],
 					},
 				},
 				{
@@ -170,7 +172,6 @@ describe("continuation buffer", () => {
 		assert.equal(continuation.turns[0]?.assistantText, "final useful update");
 		assert.deepEqual(continuation.turns[0]?.toolResults, []);
 	});
-
 });
 
 describe("pending adoption state", () => {
@@ -427,8 +428,10 @@ describe("pending adoption state", () => {
 			"slipstream",
 		);
 		assert.equal(completed.status, "summarizing");
+		assert.equal(completed.slipstreamCompactionRequest !== null, true);
 		onComplete?.({ ok: true });
 		assert.equal(completed.status, "idle");
+		assert.equal(completed.slipstreamCompactionRequest, null);
 
 		const failed = createRuntimeState({ now: 100 });
 		storePendingValidated(failed, {
@@ -455,8 +458,10 @@ describe("pending adoption state", () => {
 			),
 			"slipstream",
 		);
+		assert.equal(failed.slipstreamCompactionRequest !== null, true);
 		onError?.(new Error("failed"));
 		assert.equal(failed.status, "ready_to_adopt");
+		assert.equal(failed.slipstreamCompactionRequest, null);
 	});
 
 	it("tracks background promises and clears only the active one", async () => {

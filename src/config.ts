@@ -8,6 +8,7 @@ export type RejectedSummaryMode = "accept" | "ask" | "reject";
 export type SlipstreamConfig = {
 	enabled: boolean;
 	autoTrigger: boolean;
+	replaceDefaultCompact: boolean;
 	triggerContextPercent: number;
 	softContextPercent: number;
 	hardContextPercent: number;
@@ -33,6 +34,7 @@ export const CONFIG_KEYS = [
 export const DEFAULT_CONFIG: SlipstreamConfig = Object.freeze({
 	enabled: true,
 	autoTrigger: true,
+	replaceDefaultCompact: true,
 	triggerContextPercent: 0.6,
 	softContextPercent: 0.6,
 	hardContextPercent: 0.6,
@@ -199,13 +201,20 @@ export function normalizeConfig(raw: unknown = {}): SlipstreamConfig {
 	if (!isRecord(raw))
 		throw new Error("pi-slipstream-compact config must be an object");
 
+	const replaceDefaultCompact = optionalBoolean(
+		raw,
+		"replaceDefaultCompact",
+		DEFAULT_CONFIG.replaceDefaultCompact,
+	);
+	const rawAutoTrigger = optionalBoolean(
+		raw,
+		"autoTrigger",
+		DEFAULT_CONFIG.autoTrigger,
+	);
 	const cfg: SlipstreamConfig = {
 		enabled: optionalBoolean(raw, "enabled", DEFAULT_CONFIG.enabled),
-		autoTrigger: optionalBoolean(
-			raw,
-			"autoTrigger",
-			DEFAULT_CONFIG.autoTrigger,
-		),
+		autoTrigger: replaceDefaultCompact ? rawAutoTrigger : false,
+		replaceDefaultCompact,
 		triggerContextPercent: optionalNumber(
 			raw,
 			"triggerContextPercent",

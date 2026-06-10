@@ -333,11 +333,18 @@ export type AutoJob = {
 	finalizing: boolean;
 };
 
+export type SlipstreamCompactionRequest = {
+	id: number;
+	expiresAt: number;
+};
+
 export type RuntimeState = {
 	pending: PendingValidatedCompaction | null;
 	autoJob: AutoJob | null;
 	activePromise: Promise<unknown> | null;
 	compactionWanted: boolean;
+	nextSlipstreamCompactionRequestId: number;
+	slipstreamCompactionRequest: SlipstreamCompactionRequest | null;
 	lastArtifactDir: string | null;
 	lastJudge: JudgeResult | null;
 	progressOwner: {

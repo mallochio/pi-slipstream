@@ -19,6 +19,7 @@ import {
 	startAutoJob,
 } from "../src/auto.ts";
 import type { FinalizeAutoJobInput } from "../src/auto.ts";
+import { handleSlipstreamCommand } from "../src/commands.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { registerLifecycle, runtimeReadiness } from "../src/index.ts";
 import type { ValidatedRunResult } from "../src/pipeline.ts";
@@ -5036,6 +5037,79 @@ describe("auto Slipstream lifecycle", () => {
 		assert.equal(state.status, "summarizing");
 	});
 
+	it("turn_end prepared adoption clears request state from compact callbacks", async () => {
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "ready" }),
+		];
+		for (const callback of ["onComplete", "onError"] as const) {
+			const state = createRuntimeState();
+			storePendingValidated(state, {
+				sessionId: "s1",
+				cwd: "/repo",
+				projectId: "/repo",
+				summary: "## Goal\nReady",
+				firstKeptEntryId: "a1",
+				validatedThroughEntryId: "a1",
+				tokensBefore: 100,
+				details: { judge: { score: 8 }, artifacts: [] },
+				expiresAt: 4_000_000_000_000,
+			});
+			let onComplete: ((result: unknown) => void) | undefined;
+			let onError: ((error: Error) => void) | undefined;
+			const handlers: Partial<
+				Record<
+					"turn_end",
+					(event: unknown, ctx: unknown) => Promise<void> | void
+				>
+			> = {};
+			const pi = {
+				on: (
+					event: string,
+					handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+				) => {
+					if (event === "turn_end") handlers.turn_end = handler;
+				},
+			} as unknown as Parameters<typeof registerLifecycle>[0];
+			registerLifecycle(pi, config(), state);
+
+			await handlers.turn_end?.(
+				{
+					turnIndex: 1,
+					message: { role: "assistant", content: "ready", stopReason: "stop" },
+					toolResults: [],
+				},
+				{
+					cwd: "/repo",
+					sessionManager: {
+						getSessionId: () => "s1",
+						getBranch: () => branch,
+					},
+					getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+					compact: (options?: {
+						onComplete?: (result: unknown) => void;
+						onError?: (error: Error) => void;
+					}) => {
+						onComplete = options?.onComplete;
+						onError = options?.onError;
+					},
+					ui: {
+						setStatus: () => undefined,
+						setWidget: () => undefined,
+						notify: () => undefined,
+					},
+					isIdle: () => true,
+					hasPendingMessages: () => false,
+				},
+			);
+
+			assert.notEqual(state.slipstreamCompactionRequest, null);
+			if (callback === "onComplete") onComplete?.({ ok: true });
+			else onError?.(new Error("failed"));
+			assert.equal(state.slipstreamCompactionRequest, null);
+		}
+	});
+
 	for (const stopReason of ["error", "aborted"] as const) {
 		it(`turn_end does not auto-adopt after ${stopReason} assistant turns`, async () => {
 			const state = createRuntimeState();
@@ -5840,6 +5914,437 @@ describe("auto Slipstream lifecycle", () => {
 			},
 		});
 		assert.equal(state.status, "summarizing");
+	});
+
+	it("session_before_compact bypasses plain compact when default replacement is disabled", async () => {
+		const state = createRuntimeState();
+		const branch = [msg("a1", { role: "assistant", content: "ready" })];
+		let defaultCalls = 0;
+		const handlers: Partial<
+			Record<
+				"session_before_compact",
+				(event: unknown, ctx: unknown) => Promise<unknown> | unknown
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown,
+			) => {
+				if (event === "session_before_compact")
+					handlers.session_before_compact = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(
+			pi,
+			{ ...config(), replaceDefaultCompact: false, autoTrigger: false },
+			state,
+			{
+				buildDefaultSlipstreamCompaction: async () => {
+					defaultCalls += 1;
+					return { cancel: true };
+				},
+			},
+		);
+
+		const result = await handlers.session_before_compact?.(
+			{
+				preparation: { firstKeptEntryId: "native-boundary", tokensBefore: 200 },
+				branchEntries: branch,
+			},
+			{
+				cwd: "/repo",
+				ui: {
+					setStatus: () => undefined,
+					setWidget: () => undefined,
+					notify: () => undefined,
+				},
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+			},
+		);
+
+		assert.equal(result, undefined);
+		assert.equal(defaultCalls, 0);
+		assert.equal(state.status, "idle");
+	});
+
+	it("explicit slipstream compact still injects a summary when default replacement is disabled", async () => {
+		const parent = join(process.cwd(), ".scratch", "test-tmp");
+		await mkdir(parent, { recursive: true });
+		const root = await mkdtemp(join(parent, "slipstream-explicit-"));
+		try {
+			const state = createRuntimeState();
+			const branch = [msg("a1", { role: "assistant", content: "ready" })];
+			const handlers: Partial<
+				Record<
+					"session_before_compact",
+					(event: unknown, ctx: unknown) => Promise<unknown> | unknown
+				>
+			> = {};
+			const pi = {
+				on: (
+					event: string,
+					handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown,
+				) => {
+					if (event === "session_before_compact")
+						handlers.session_before_compact = handler;
+				},
+			} as unknown as Parameters<typeof registerLifecycle>[0];
+			const cfg = {
+				...config(),
+				replaceDefaultCompact: false,
+				autoTrigger: false,
+				artifactRoot: root,
+			};
+			registerLifecycle(pi, cfg, state, {
+				buildDefaultSlipstreamCompaction: async () => {
+					throw new Error("explicit compact should consume pending summary");
+				},
+			});
+			let compactCalls = 0;
+			const ctx = {
+				cwd: process.cwd(),
+				modelRegistry: {
+					find: () => undefined,
+					getApiKeyAndHeaders: async () => ({}),
+				},
+				ui: {
+					setStatus: () => undefined,
+					setWidget: () => undefined,
+					notify: () => undefined,
+				},
+				sessionManager: {
+					getSessionId: () => "s-explicit",
+					getBranch: () => branch,
+				},
+				compact: () => {
+					compactCalls += 1;
+				},
+			};
+
+			const commandResult = await handleSlipstreamCommand(
+				"compact",
+				state,
+				cfg,
+				ctx,
+				{
+					createSummaryCompleter: () => async () => "## Goal\nReady summary",
+					createJudgeCompleter: () => async () => ({
+						score: 9,
+						decision: "accept",
+						missing: [],
+						contradictions: [],
+						diagnosis: "ok",
+					}),
+				},
+			);
+
+			assert.equal(commandResult.ok, true);
+			assert.equal(compactCalls, 1);
+
+			const result = await handlers.session_before_compact?.(
+				{
+					preparation: {
+						firstKeptEntryId: "native-boundary",
+						tokensBefore: 200,
+					},
+					branchEntries: branch,
+				},
+				ctx,
+			);
+
+			assert.ok(result && typeof result === "object" && "compaction" in result);
+			const compaction = result.compaction as {
+				summary: string;
+				firstKeptEntryId: string;
+				tokensBefore: number;
+				details: { judge: { score: number } };
+			};
+			assert.match(compaction.summary, /Ready summary/);
+			assert.equal(compaction.firstKeptEntryId, "a1");
+			assert.equal(compaction.tokensBefore, 200);
+			assert.equal(compaction.details.judge.score, 9);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("explicit slipstream compact --adopt still injects a summary when default replacement is disabled", async () => {
+		const state = createRuntimeState();
+		const branch = [msg("a1", { role: "assistant", content: "ready" })];
+		const handlers: Partial<
+			Record<
+				"session_before_compact",
+				(event: unknown, ctx: unknown) => Promise<unknown> | unknown
+			>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown,
+			) => {
+				if (event === "session_before_compact")
+					handlers.session_before_compact = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		const cfg = {
+			...config(),
+			replaceDefaultCompact: false,
+			autoTrigger: false,
+		};
+		registerLifecycle(pi, cfg, state, {
+			buildDefaultSlipstreamCompaction: async () => {
+				throw new Error("explicit adopt should consume pending summary");
+			},
+		});
+		storePendingValidated(state, {
+			sessionId: "s-adopt",
+			cwd: "/repo",
+			projectId: "p1",
+			summary: "validated adopt summary",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 100,
+			details: { judge: { score: 9 }, artifacts: [] },
+			expiresAt: Date.now() + 10_000,
+		});
+		let compactCalls = 0;
+		const ctx = {
+			cwd: "/repo",
+			ui: {
+				setStatus: () => undefined,
+				setWidget: () => undefined,
+				notify: () => undefined,
+			},
+			sessionManager: {
+				getSessionId: () => "s-adopt",
+				getBranch: () => branch,
+			},
+			compact: () => {
+				compactCalls += 1;
+			},
+		};
+
+		const commandResult = await handleSlipstreamCommand(
+			"compact --adopt",
+			state,
+			cfg,
+			ctx,
+			{ now: () => Date.now() },
+		);
+
+		assert.equal(commandResult.ok, true);
+		assert.equal(compactCalls, 1);
+
+		const result = await handlers.session_before_compact?.(
+			{
+				preparation: { firstKeptEntryId: "native-boundary", tokensBefore: 200 },
+				branchEntries: branch,
+			},
+			ctx,
+		);
+
+		assert.ok(result && typeof result === "object" && "compaction" in result);
+		const compaction = result.compaction as {
+			summary: string;
+			firstKeptEntryId: string;
+			tokensBefore: number;
+			details: { judge: { score: number } };
+		};
+		assert.equal(compaction.summary, "validated adopt summary");
+		assert.equal(compaction.firstKeptEntryId, "a1");
+		assert.equal(compaction.tokensBefore, 200);
+		assert.equal(compaction.details.judge.score, 9);
+	});
+
+	it("explicit slipstream compact cancels instead of falling through when pending is stale", async () => {
+		const parent = join(process.cwd(), ".scratch", "test-tmp");
+		await mkdir(parent, { recursive: true });
+		const root = await mkdtemp(join(parent, "slipstream-stale-explicit-"));
+		try {
+			const state = createRuntimeState();
+			const branchAtPrepare = [
+				msg("a1", { role: "assistant", content: "ready" }),
+			];
+			const branchAtCompact = [
+				...branchAtPrepare,
+				msg("a2", { role: "assistant", content: "newer state" }),
+			];
+			const handlers: Partial<
+				Record<
+					"session_before_compact",
+					(event: unknown, ctx: unknown) => Promise<unknown> | unknown
+				>
+			> = {};
+			const pi = {
+				on: (
+					event: string,
+					handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown,
+				) => {
+					if (event === "session_before_compact")
+						handlers.session_before_compact = handler;
+				},
+			} as unknown as Parameters<typeof registerLifecycle>[0];
+			const cfg = {
+				...config(),
+				replaceDefaultCompact: false,
+				autoTrigger: false,
+				artifactRoot: root,
+			};
+			registerLifecycle(pi, cfg, state);
+			let compactCalls = 0;
+			const ctx = {
+				cwd: process.cwd(),
+				modelRegistry: {
+					find: () => undefined,
+					getApiKeyAndHeaders: async () => ({}),
+				},
+				ui: {
+					setStatus: () => undefined,
+					setWidget: () => undefined,
+					notify: () => undefined,
+				},
+				sessionManager: {
+					getSessionId: () => "s-stale-explicit",
+					getBranch: () => branchAtPrepare,
+				},
+				compact: () => {
+					compactCalls += 1;
+				},
+			};
+
+			const commandResult = await handleSlipstreamCommand(
+				"compact",
+				state,
+				cfg,
+				ctx,
+				{
+					createSummaryCompleter: () => async () => "## Goal\nReady summary",
+					createJudgeCompleter: () => async () => ({
+						score: 9,
+						decision: "accept",
+						missing: [],
+						contradictions: [],
+						diagnosis: "ok",
+					}),
+				},
+			);
+
+			assert.equal(commandResult.ok, true);
+			assert.equal(compactCalls, 1);
+
+			const result = await handlers.session_before_compact?.(
+				{
+					preparation: {
+						firstKeptEntryId: "native-boundary",
+						tokensBefore: 200,
+					},
+					branchEntries: branchAtCompact,
+				},
+				{
+					...ctx,
+					sessionManager: {
+						...ctx.sessionManager,
+						getBranch: () => branchAtCompact,
+					},
+				},
+			);
+
+			assert.deepEqual(result, { cancel: true });
+			assert.equal(state.pending, null);
+			assert.equal(state.slipstreamCompactionRequest, null);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("expired explicit slipstream compact cancels instead of falling through", async () => {
+		const parent = join(process.cwd(), ".scratch", "test-tmp");
+		await mkdir(parent, { recursive: true });
+		const root = await mkdtemp(join(parent, "slipstream-expired-explicit-"));
+		try {
+			const state = createRuntimeState();
+			const branch = [msg("a1", { role: "assistant", content: "ready" })];
+			const handlers: Partial<
+				Record<
+					"session_before_compact",
+					(event: unknown, ctx: unknown) => Promise<unknown> | unknown
+				>
+			> = {};
+			const pi = {
+				on: (
+					event: string,
+					handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown,
+				) => {
+					if (event === "session_before_compact")
+						handlers.session_before_compact = handler;
+				},
+			} as unknown as Parameters<typeof registerLifecycle>[0];
+			const cfg = {
+				...config(),
+				replaceDefaultCompact: false,
+				autoTrigger: false,
+				artifactRoot: root,
+			};
+			registerLifecycle(pi, cfg, state);
+			const ctx = {
+				cwd: process.cwd(),
+				modelRegistry: {
+					find: () => undefined,
+					getApiKeyAndHeaders: async () => ({}),
+				},
+				ui: {
+					setStatus: () => undefined,
+					setWidget: () => undefined,
+					notify: () => undefined,
+				},
+				sessionManager: {
+					getSessionId: () => "s-expired-explicit",
+					getBranch: () => branch,
+				},
+				compact: () => undefined,
+			};
+
+			const commandResult = await handleSlipstreamCommand(
+				"compact",
+				state,
+				cfg,
+				ctx,
+				{
+					createSummaryCompleter: () => async () => "## Goal\nReady summary",
+					createJudgeCompleter: () => async () => ({
+						score: 9,
+						decision: "accept",
+						missing: [],
+						contradictions: [],
+						diagnosis: "ok",
+					}),
+				},
+			);
+			assert.equal(commandResult.ok, true);
+			assert.notEqual(state.slipstreamCompactionRequest, null);
+			state.slipstreamCompactionRequest!.expiresAt = 0;
+
+			const result = await handlers.session_before_compact?.(
+				{
+					preparation: {
+						firstKeptEntryId: "native-boundary",
+						tokensBefore: 200,
+					},
+					branchEntries: branch,
+				},
+				ctx,
+			);
+
+			assert.deepEqual(result, { cancel: true });
+			assert.equal(state.pending, null);
+			assert.equal(state.slipstreamCompactionRequest, null);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("session_before_compact runs default compaction when initial status UI is stale", async () => {
