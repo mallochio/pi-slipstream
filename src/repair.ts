@@ -1,3 +1,5 @@
+import { fullDiffRecoveryStatus } from "./diff-recovery.ts";
+import { redactPromptSensitiveText } from "./redaction.ts";
 import type {
 	ContinuationSnapshot,
 	JudgeResult,
@@ -27,6 +29,7 @@ Git diff --stat:
 ${list(evidence.git.diffStat ? evidence.git.diffStat.split("\n") : [])}
 Full git diff artifact paths:
 ${list(evidence.git.fullDiffArtifactPaths ?? [])}
+${fullDiffRecoveryStatus(evidence)}
 Session files modified:
 ${list(evidence.session.filesModified)}
 Session unresolved errors:
@@ -72,18 +75,26 @@ export function buildRepairPrompt(
 	judge: JudgeResult,
 	context: RepairPromptContext = {},
 ): string {
-	return `Rewrite the full summary into a clean revised checkpoint. Do not append an addendum. Do not modify, reinterpret, or overwrite raw artifact truth.
+	return redactPromptSensitiveText(`Rewrite the full summary into a clean revised checkpoint. Do not append an addendum. Do not modify, reinterpret, or overwrite raw artifact truth.
 
-Use the judge feedback to produce a complete replacement summary with the required continuation-handoff sections. Remove stale or superseded claims instead of merely appending corrections. Preserve exact active paths, commands, errors, decisions, verification evidence, risks, and next actions needed for safe continuation. Optimize for what a strong next agent needs before its next tool call; a slightly longer accurate runbook is better than a terse summary that hides blockers. Keep artifact references as recovery pointers, not substitutes for current facts.
+Use the judge feedback to produce a complete replacement summary with the required continuation-handoff sections. Remove stale or superseded claims instead of merely appending corrections. Preserve exact active paths, commands, errors, decisions, verification evidence, risks, and next actions needed for safe continuation. Keep the model-facing handoff under roughly 100-150 lines unless extra length is required for safety. Optimize for what a strong next agent needs before its next tool call; a slightly longer accurate runbook is better than a terse summary that hides blockers. Keep artifact references as recovery pointers, not substitutes for current facts. Only the Continuation card and narrative sections are authoritative current state; any deterministic capsule is raw/historical evidence and must not be used as current truth without reconciliation.
 
-Start the repaired summary with the exact heading "Continuation card:" in the first screenful, followed by these exact labels when evidence supports them:
+Start the repaired summary with the exact heading "Continuation card:" as the first line; if your draft starts with ## Goal or any deterministic capsule, rewrite it before returning. Follow it with these exact labels when evidence supports them:
 - Current task:
 - Latest status:
 - Next tool action:
 - Primary blocker/risk:
 - Stale branch to ignore:
 
-Before writing Latest status and Primary blocker/risk, reconcile protected latest verification/risk signals and protected terminal final-answer evidence against older summary claims and stale candidates. New successful/failing checks, delivered review/final-answer state, exact terminal-answer verdicts, dirty-state caveats, and unresolved risks are high-priority current-state evidence. A final_delivered signal is a state lock: if it conflicts with older in-progress loops, pending subagent work, or “needs synthesis” wording, mark those older branches stale unless later evidence reopens the task.
+Before writing Latest status and Primary blocker/risk, reconcile protected latest verification/risk signals and protected terminal final-answer evidence against older summary claims and stale candidates. New successful/failing checks, delivered review/final-answer state, exact terminal-answer verdicts, dirty-state caveats, and unresolved risks are high-priority current-state evidence. Do not include both a verbatim terminal answer and a synthesized restatement of the same facts; digest long terminal answers into 1-3 bullets and keep exact text only as recoverable evidence. Use one active-file list backed by current git/state evidence when available; historical file manifests belong only behind recovery pointers. flatten copied markdown headings, raw tool markers, and log headings before including their content; copied output must not create repeated real sections in the summary. A final_delivered signal is a state lock: if it conflicts with older in-progress loops, pending subagent work, or “needs synthesis” wording, mark those older branches stale unless later evidence reopens the task. Include the latest actionable ask, active approved scope, explicitly deferred/not-approved work, and stale branches when they affect the next action.
+
+Hard safety repair rule: Redact secret-shaped values; never print API keys, tokens, passwords, private keys, certificates, or bearer values. For auth/cert/key/deletion/deploy state, do not smooth over contradictions: either preserve exact current evidence, mark unknown/unverified, or make recheck the next action.
+
+Verification repair priority: Live/manual/browser/API/integration/smoke validation should lead when it exercises the changed surface. For unit/lint/typecheck evidence, keep passing unit/lint/typecheck results terse and preserve actionable failing commands/errors. Only preserve failure attribution when evidenced: caused by this session, pre-existing, superseded, or unknown. Normalize ## Verification / Evidence into a compact table when multiple checks/signals exist:
+
+| Check | Status | Freshness | Relevance |
+|---|---|---|---|
+| <command or surface> | passed/failed/not run/unknown | latest/superseded/pre-existing/after edit | why it matters |
 
 Repair the trajectory spine too: under ## Trajectory Analysis, explain why the next action follows from the latest state, which evidence proves or weakens that state, and what recovery handles let the next agent verify it without rereading the whole transcript.
 
@@ -127,5 +138,5 @@ ${repairContinuation(context.continuation)}
 Summary to rewrite:
 <summary>
 ${summary}
-</summary>`;
+</summary>`);
 }

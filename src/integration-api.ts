@@ -1,4 +1,5 @@
 import { isAccepted, parseJudgeResult } from "./judge.ts";
+import { redactPromptSensitiveText } from "./redaction.ts";
 import { isDegenerateCandidateSummary } from "./summary.ts";
 import type { CompleteTextFn, JudgeResult } from "./types.ts";
 
@@ -64,7 +65,7 @@ function buildExternalJudgePrompt(
 	candidate: string,
 	input: ValidateOnlyInput,
 ): string {
-	return `You are the Slipstream artifact-free integration API judge. Judge the candidate summary against only the caller-provided source evidence and continuation. This API is artifact-free: do not assume hidden local files, stats, widgets, pending state, or ctx.compact side effects exist.\n\nReturn only JSON with this shape:\n{\n  "score": 0-10,\n  "decision": "accept" | "reject",\n  "missing": ["..."],\n  "contradictions": ["..."],\n  "diagnosis": "..."\n}\n\nReject if the candidate omits current constraints, unresolved errors, user decisions, or next-action information needed for safe continuation.\n\nSource evidence:\n${renderEvidence(input.sourceEvidence)}\n\nContinuation evidence:\n${renderContinuation(input.continuation)}\n\nCandidate summary:\n<summary>\n${candidate}\n</summary>`;
+	return redactPromptSensitiveText(`You are the Slipstream artifact-free integration API judge. Judge the candidate summary against only the caller-provided source evidence and continuation. This API is artifact-free: do not assume hidden local files, stats, widgets, pending state, or ctx.compact side effects exist.\n\nReturn only JSON with this shape:\n{\n  "score": 0-10,\n  "decision": "accept" | "reject",\n  "missing": ["..."],\n  "contradictions": ["..."],\n  "diagnosis": "..."\n}\n\nReject if the candidate omits current constraints, unresolved errors, user decisions, or next-action information needed for safe continuation. Accept safe score-8 handoffs with advisory warnings when current state and next action are clear. Do not let advisory missing[] items veto acceptance, but reject critical contradictions. Live/manual/browser/API/integration/smoke verification outranks unit tests when it exercises the changed surface; passing unit/lint/typecheck evidence should be terse, while actionable failing checks need command/error and evidenced attribution. Hard-reject secret-shaped values, contradictions involving auth/cert/key/deletion/deploy state, wrong current dirty-state claims, terminal-vs-pending contradictions, and stale current-state claims that can mislead the next action.\n\nSource evidence:\n${renderEvidence(input.sourceEvidence)}\n\nContinuation evidence:\n${renderContinuation(input.continuation)}\n\nCandidate summary:\n<summary>\n${candidate}\n</summary>`);
 }
 
 function buildExternalRepairPrompt(
@@ -72,7 +73,26 @@ function buildExternalRepairPrompt(
 	judge: JudgeResult,
 	input: ValidateOnlyInput,
 ): string {
-	return `Rewrite the full candidate summary for the Slipstream artifact-free integration API. Preserve true useful content from the candidate, fix the judge findings, and ground the summary only in caller-provided source evidence and continuation. Do not mention hidden artifacts, stats, widgets, pending state, or ctx.compact side effects.\n\nJudge diagnosis: ${judge.diagnosis}\nMissing facts:\n${list(judge.missing)}\nContradictions:\n${list(judge.contradictions)}\n\nSource evidence:\n${renderEvidence(input.sourceEvidence)}\n\nContinuation evidence:\n${renderContinuation(input.continuation)}\n\nPrevious candidate summary:\n<summary>\n${candidate}\n</summary>`;
+	return redactPromptSensitiveText(`Rewrite the full candidate summary for the Slipstream artifact-free integration API. Preserve true useful content from the candidate, fix the judge findings, and ground the summary only in caller-provided source evidence and continuation. Do not mention hidden artifacts, stats, widgets, pending state, or ctx.compact side effects.
+
+Use the same paired policy as main Slipstream: make the current state and next action clear enough that safe score-8 handoffs can be accepted with advisory warnings, while fixing the causes of hard rejects. Start repaired summaries with "Continuation card:" as the first line; if your draft starts with ## Goal or any deterministic capsule, rewrite it before returning. Keep the model-facing handoff under roughly 100-150 lines unless extra length is required for safety. Do not include both a verbatim terminal answer and a synthesized restatement of the same facts; digest long terminal answers into 1-3 bullets and keep exact text only as recoverable evidence. Use one active-file list backed by current evidence when available; historical file manifests belong only behind recovery pointers. flatten copied markdown headings, raw tool markers, and log headings before including their content; copied output must not create repeated real sections in the summary. Live/manual/browser/API/integration/smoke verification should lead when it exercises the changed surface. Keep passing unit/lint/typecheck evidence terse. Preserve actionable failing checks with command/error and evidenced attribution. Normalize ## Verification / Evidence into a compact table when multiple checks/signals exist:\n\n| Check | Status | Freshness | Relevance |\n|---|---|---|---|\n| <command or surface> | passed/failed/not run/unknown | latest/superseded/pre-existing/after edit | why it matters |\n\nRedact secret-shaped values; never print API keys, tokens, passwords, private keys, certificates, or bearer values. For auth/cert/key/deletion/deploy state, wrong current dirty-state claims, terminal-vs-pending contradictions, and stale current-state claims, do not smooth over contradictions: preserve exact current evidence, mark unknown/unverified, or make recheck the next action.
+
+Judge diagnosis: ${judge.diagnosis}
+Missing facts:
+${list(judge.missing)}
+Contradictions:
+${list(judge.contradictions)}
+
+Source evidence:
+${renderEvidence(input.sourceEvidence)}
+
+Continuation evidence:
+${renderContinuation(input.continuation)}
+
+Previous candidate summary:
+<summary>
+${candidate}
+</summary>`);
 }
 
 function clampRepairAttempts(value: number | undefined): number {
@@ -98,12 +118,14 @@ export async function slipstreamStyleValidateAndRepair(
 	);
 	let repaired = false;
 	let repairCount = 0;
-	let bestAcceptedSummary = isAccepted(judge, threshold) ? summary : null;
-	let bestAcceptedJudge = isAccepted(judge, threshold) ? judge : null;
+	let bestAcceptedSummary = isAccepted(judge, threshold, summary)
+		? summary
+		: null;
+	let bestAcceptedJudge = isAccepted(judge, threshold, summary) ? judge : null;
 
 	for (
 		let attempt = 0;
-		attempt < repairAttempts && !isAccepted(judge, threshold);
+		attempt < repairAttempts && !isAccepted(judge, threshold, summary);
 		attempt += 1
 	) {
 		const repairedSummary = await input.completeText(
@@ -121,7 +143,7 @@ export async function slipstreamStyleValidateAndRepair(
 			),
 		);
 		if (
-			isAccepted(judge, threshold) &&
+			isAccepted(judge, threshold, summary) &&
 			(bestAcceptedJudge === null || judge.score > bestAcceptedJudge.score)
 		) {
 			bestAcceptedSummary = summary;
@@ -136,7 +158,7 @@ export async function slipstreamStyleValidateAndRepair(
 
 	return {
 		summary,
-		accepted: isAccepted(judge, threshold),
+		accepted: isAccepted(judge, threshold, summary),
 		repaired,
 		score: judge.score,
 		missing: judge.missing,

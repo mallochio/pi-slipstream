@@ -363,13 +363,15 @@ export async function runValidatedSlipstream(
 	let repaired = false;
 	const threshold = input.judgeThreshold ?? 7;
 	const repairAttempts = input.repairAttempts ?? 1;
-	let bestAcceptedSummary = isAccepted(judge, threshold) ? summary : null;
-	let bestAcceptedJudge = isAccepted(judge, threshold) ? judge : null;
+	let bestAcceptedSummary = isAccepted(judge, threshold, summary)
+		? summary
+		: null;
+	let bestAcceptedJudge = isAccepted(judge, threshold, summary) ? judge : null;
 	const repairStartedAt = Date.now();
 
 	for (
 		let attempt = 0;
-		attempt < repairAttempts && !isAccepted(judge, threshold);
+		attempt < repairAttempts && !isAccepted(judge, threshold, summary);
 		attempt += 1
 	) {
 		input.onProgress?.({
@@ -419,7 +421,7 @@ export async function runValidatedSlipstream(
 			input.signal,
 		);
 		if (
-			isAccepted(judge, threshold) &&
+			isAccepted(judge, threshold, summary) &&
 			(bestAcceptedJudge === null || judge.score > bestAcceptedJudge.score)
 		) {
 			bestAcceptedSummary = summary;
@@ -433,7 +435,7 @@ export async function runValidatedSlipstream(
 		judge = bestAcceptedJudge;
 	}
 	await store.writeJudgeResult(run, judge);
-	const accepted = isAccepted(judge, threshold);
+	const accepted = isAccepted(judge, threshold, summary);
 	input.onProgress?.({
 		phase: accepted ? "accepted" : "rejected",
 		message: accepted

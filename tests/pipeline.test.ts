@@ -256,7 +256,7 @@ describe("pipeline", () => {
 				continuation: { triggerEntryId: "a6", turns: [] },
 				completeSummary: async (prompt) => {
 					summaryPrompt = prompt;
-					return "## Goal\nContinue\n\n## Latest compacted updates\n- reserve gpt-5.5 for manual checkpoints";
+					return "Continuation card:\n- Current task: Continue\n\n## Goal\nContinue\n\n## Latest compacted updates\n- reserve gpt-5.5 for manual checkpoints";
 				},
 				completeJudge: async (prompt) => {
 					judgePrompt = prompt;
@@ -271,7 +271,9 @@ describe("pipeline", () => {
 			});
 
 			assert.equal(result.accepted, true);
-			assert.match(result.summary, /Deterministic Current-State Capsule/);
+			assert.match(result.summary, /^Continuation card:/);
+			assert.match(result.summary, /## Goal\nContinue/);
+			assert.match(result.summary, /## Deterministic Evidence Capsule/);
 			assert.match(result.summary, /Latest user request/);
 			assert.match(result.summary, /reserve gpt-5\.5 for manual checkpoints/);
 			assert.match(summaryPrompt, /Latest compacted updates/);

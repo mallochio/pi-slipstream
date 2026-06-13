@@ -248,6 +248,7 @@ export type JudgeDecision = "accept" | "reject";
 export type JudgeResult = {
 	score: number;
 	decision: JudgeDecision;
+	judgeStatus?: "parsed" | "parse_error";
 	planAlignment?: number;
 	statementSufficiency?: number;
 	nonContradiction?: number;
