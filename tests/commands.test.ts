@@ -496,7 +496,8 @@ describe("commands", () => {
 				getContextUsage: () => ({ tokens: 1000 }),
 			},
 			{
-				createSummaryCompleter: () => async () => "## Goal\nUse Slipstream",
+				createSummaryCompleter: () => async () =>
+					"Continuation card:\n- Current task: Use Slipstream\n\n## Goal\nUse Slipstream",
 				createJudgeCompleter: () => async () => ({
 					score: 8,
 					decision: "accept",
@@ -509,11 +510,12 @@ describe("commands", () => {
 		);
 
 		assert.equal(result.ok, true);
+		assert.match(state.pending?.summary ?? "", /^Continuation card:/);
+		assert.match(state.pending?.summary ?? "", /## Goal\nUse Slipstream/);
 		assert.match(
 			state.pending?.summary ?? "",
-			/Deterministic Current-State Capsule/,
+			/## Deterministic Evidence Capsule/,
 		);
-		assert.match(state.pending?.summary ?? "", /## Goal\nUse Slipstream/);
 		assert.equal(state.pending?.validatedThroughEntryId, "a1");
 		assert.equal(state.pending?.expiresAt, 10_100);
 	});

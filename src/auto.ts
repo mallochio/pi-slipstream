@@ -453,13 +453,16 @@ export async function finalizeAutoJob(
 		if (isInvalidated()) return false;
 		job.stats.timingsMs.judging = elapsedMs(judgingStartedAt);
 		const threshold = input.config.judgeThreshold;
-		let bestAcceptedSummary = isAccepted(judge, threshold) ? summary : null;
-		let bestAcceptedJudge = isAccepted(judge, threshold) ? judge : null;
+		let bestAcceptedSummary = isAccepted(judge, threshold, summary)
+			? summary
+			: null;
+		let bestAcceptedJudge = isAccepted(judge, threshold, summary) ? judge : null;
 		let repaired = false;
 		const repairStartedAt = Date.now();
 		for (
 			let attempt = 0;
-			attempt < input.config.repairAttempts && !isAccepted(judge, threshold);
+			attempt < input.config.repairAttempts &&
+			!isAccepted(judge, threshold, summary);
 			attempt += 1
 		) {
 			input.state.status = "repairing";
@@ -514,7 +517,7 @@ export async function finalizeAutoJob(
 			);
 			if (isInvalidated()) return false;
 			if (
-				isAccepted(judge, threshold) &&
+				isAccepted(judge, threshold, summary) &&
 				(bestAcceptedJudge === null || judge.score > bestAcceptedJudge.score)
 			) {
 				bestAcceptedSummary = summary;
@@ -529,7 +532,7 @@ export async function finalizeAutoJob(
 		if (isInvalidated()) return false;
 		await store.writeJudgeResult(run, judge);
 		if (isInvalidated()) return false;
-		const accepted = isAccepted(judge, input.config.judgeThreshold);
+		const accepted = isAccepted(judge, input.config.judgeThreshold, summary);
 		if (!job.firstKeptEntryId) {
 			await writeStats("rejected", accepted, repaired, judge);
 			if (isInvalidated()) return false;

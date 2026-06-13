@@ -82,24 +82,60 @@ const snapshot: Snapshot = {
 };
 
 describe("summary, judge, and repair", () => {
-	it("prepends a deterministic current-state capsule before model prose", () => {
-		const capsule = buildCurrentStateCapsule(snapshot, ["artifact://new"]);
+	it("appends only a compact non-authoritative recovery capsule after model prose", () => {
+		const noisySnapshot: Snapshot = {
+			...snapshot,
+			manifest: {
+				...snapshot.manifest,
+				terminalFinalAnswerEvidence: [
+					"Terminal latest assistant answer [a-final] exact text:\n## Passed live\nThe exhaustive live-test report is intentionally long and should not be copied verbatim.\n\n## Passed live\nDuplicate heading block that belongs in recovery only.\n\nFinal verdict: wait for user follow-up. Risk: git status came from wrapper CWD. Verification caveat: npm test failed before repair.",
+				],
+				filesModified: Array.from(
+					{ length: 30 },
+					(_, index) => `/repo/src/noisy-${index}.ts`,
+				),
+				staleSignals: Array.from({ length: 20 }, (_, index) => ({
+					text: `stale branch ${index}`,
+					reason: "later evidence superseded it",
+				})),
+				artifactRefs: [
+					"/repo/.scratch/compactions/old-run/state-evidence.json",
+					"/repo/.scratch/compactions/old-run/trigger-raw-001.json",
+				],
+			},
+		};
+		const capsule = buildCurrentStateCapsule(noisySnapshot, [
+			"/repo/.scratch/compactions/run-1/git-diff-full-001.patch",
+		]);
 		const summary = withCurrentStateCapsule(
-			"## Goal\nContinue safely",
-			snapshot,
-			["artifact://new"],
+			"Continuation card:\n- Current task: Continue safely\n\n## Goal\nContinue safely",
+			noisySnapshot,
+			["/repo/.scratch/compactions/run-1/git-diff-full-001.patch"],
 		);
 
-		assert.match(capsule, /Latest user\/assistant exchange state/);
-		assert.match(capsule, /Terminal latest assistant answer/);
-		assert.match(capsule, /npm test failed before repair/);
-		assert.match(capsule, /Use Slipstream/);
-		assert.match(capsule, /modified: \/repo\/src\/b\.ts/);
-		assert.match(capsule, /artifact:\/\/raw/);
-		assert.match(capsule, /artifact:\/\/new/);
-		assert.match(summary, /^## Deterministic Current-State Capsule/);
-		assert.match(summary, /---\n\n## Goal\nContinue safely$/);
-		assert.equal(withCurrentStateCapsule(summary, snapshot), summary);
+		assert.match(capsule, /^## Deterministic Evidence Capsule/);
+		assert.match(capsule, /compact non-authoritative recovery index/);
+		assert.match(capsule, /Terminal answer digest/);
+		assert.match(capsule, /Final verdict: wait for user follow-up/);
+		assert.doesNotMatch(capsule, /## Passed live/);
+		assert.doesNotMatch(capsule, /exhaustive live-test report is intentionally long/);
+		assert.doesNotMatch(capsule, /noisy-29/);
+		assert.doesNotMatch(capsule, /Session-history changed files/);
+		assert.match(capsule, /Active risk\/verification digest/);
+		assert.match(capsule, /Recovery pointer: \/repo\/\.scratch\/compactions\/run-1/);
+		assert.doesNotMatch(capsule, /Recovery pointer: \/repo\/\.scratch\/compactions\/old-run/);
+		assert.equal(capsule.split("\n").length <= 32, true);
+		assert.match(summary, /^Continuation card:/);
+		assert.match(summary, /## Goal\nContinue safely\n\n---\n\n## Deterministic Evidence Capsule/);
+
+		const normalized = withCurrentStateCapsule(
+			`## Deterministic Current-State Capsule\n\nOld authoritative capsule\n\n---\n\nContinuation card:\n- Current task: Continue safely\n\n## Goal\nContinue safely`,
+			noisySnapshot,
+			["/repo/.scratch/compactions/run-1/git-diff-full-001.patch"],
+		);
+		assert.match(normalized, /^Continuation card:/);
+		assert.doesNotMatch(normalized, /Old authoritative capsule/);
+		assert.match(normalized, /## Goal\nContinue safely\n\n---\n\n## Deterministic Evidence Capsule/);
 	});
 
 	it("builds a grounded summary prompt with protected manifest sections", () => {
@@ -107,6 +143,15 @@ describe("summary, judge, and repair", () => {
 			artifactRefs: ["artifact://raw"],
 		});
 		assert.match(prompt, /Revise the previous checkpoint/);
+		assert.match(prompt, /summary itself must start with the Continuation card as the first line/);
+		assert.match(prompt, /if your draft starts with ## Goal or any deterministic capsule/);
+		assert.match(prompt, /Only the Continuation card and narrative sections are authoritative/);
+		assert.match(prompt, /The deterministic capsule is raw\/historical evidence/);
+		assert.match(prompt, /model-facing handoff under roughly 100-150 lines/);
+		assert.match(prompt, /Do not include both a verbatim terminal answer and a synthesized restatement/);
+		assert.match(prompt, /flatten copied markdown headings/);
+		assert.match(prompt, /\| Check \| Status \| Freshness \| Relevance \|/);
+		assert.match(prompt, /one active-file list/);
 		assert.match(
 			prompt,
 			/Current\/latest user requests.*override older summaries/s,
@@ -119,7 +164,7 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /## Session Findings/);
 		assert.match(prompt, /at most 5 bullets/);
 		assert.match(prompt, /durable facts/);
-		assert.match(prompt, /exact heading "Continuation card:"/);
+		assert.match(prompt, /exact heading "Continuation card:" as the first line/);
 		assert.match(prompt, /Current task:/);
 		assert.match(prompt, /Latest status:/);
 		assert.match(prompt, /Next tool action:/);
@@ -129,6 +174,7 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /Files modified/);
 		assert.match(prompt, /\/repo\/src\/b.ts/);
 		assert.match(prompt, /Artifact references/);
+		assert.equal((prompt.match(/artifact:\/\/raw/g) ?? []).length, 2);
 		assert.match(prompt, /Use Slipstream/);
 		assert.match(prompt, /TASK-1:high:alpha\|shared\|gamma/);
 		assert.match(prompt, /Latest compacted updates/);
@@ -148,6 +194,10 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /carry that content into Latest status/);
 		assert.match(prompt, /Latest verification and risk signals/);
 		assert.match(prompt, /verification_failure: npm test failed before repair/);
+		assert.match(prompt, /Live\/manual\/browser\/API\/integration\/smoke validation/);
+		assert.match(prompt, /Passing unit\/lint\/typecheck evidence should be terse/);
+		assert.match(prompt, /Do not preserve full passing unit-test inventories/);
+		assert.match(prompt, /Normalize ## Verification \/ Evidence into a compact table/);
 		assert.match(
 			prompt,
 			/final_delivered: Final audit answer was already sent/,
@@ -161,6 +211,10 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /unrelated Pi\/config git status/);
 		assert.match(prompt, /risk: git status came from wrapper CWD/);
 		assert.match(prompt, /not a substitute for critical current-state facts/);
+		assert.match(prompt, /active approved scope/);
+		assert.match(prompt, /latest actionable ask/);
+		assert.match(prompt, /Redact secret-shaped values/);
+		assert.match(prompt, /auth\/cert\/key\/deletion\/deploy/);
 		assert.match(prompt, /stale or superseded candidates/i);
 	});
 
@@ -175,6 +229,9 @@ describe("summary, judge, and repair", () => {
 					diffStat: "src/b.ts | 2 +-",
 					diff: "+STATE_EVIDENCE_SENTINEL",
 					errors: [],
+					fullDiffArtifactPaths: ["/repo/.scratch/compactions/run/git-diff-full-omitted.txt"],
+					fullDiffComplete: false,
+					fullDiffPreserved: false,
 				},
 				session: {
 					filesRead: ["/repo/src/a.ts"],
@@ -208,7 +265,111 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /state evidence should preserve terminal answer/);
 		assert.match(prompt, / M src\/b\.ts/);
 		assert.match(prompt, /\+STATE_EVIDENCE_SENTINEL/);
+		assert.match(prompt, /Full git diff recovery: partial/);
+		assert.match(prompt, /rerun git diff/);
 		assert.doesNotMatch(prompt, /Chunk evidence/);
+	});
+
+	it("redacts secret-retrieval commands and env values from model prompts", () => {
+		const prompt = buildSummaryPrompt(
+			{
+				...snapshot,
+				summaryInputMessages: [
+					"Run grep '^OPENWEBUI_ADMIN_PASSWORD=' .env | cut -d= -f2- | wl-copy before continuing.",
+				],
+				manifest: {
+					...snapshot.manifest,
+					latestUpdates: ["WEBUI_SECRET_KEY=dev-smoke-secret"],
+					terminalFinalAnswerEvidence: [
+						"Terminal latest assistant answer [a1] exact text:\nUse OPENWEBUI_ADMIN_PASSWORD=supersecretvalue to log in.",
+					],
+				},
+			},
+			{
+				stateEvidence: {
+					generatedAt: "2026-05-27T00:00:00.000Z",
+					cwd: "/repo",
+					git: {
+						available: true,
+						statusShort: "",
+						diffStat: "",
+						diff: "",
+						errors: [],
+					},
+					session: {
+						filesRead: [],
+						filesModified: [],
+						filesDeleted: [],
+						unresolvedErrors: [
+							"grep '^OPENWEBUI_ADMIN_PASSWORD=' .env | cut -d= -f2- | wl-copy",
+						],
+						userDecisions: [],
+						constraints: [],
+						openLoops: [],
+						recentVerification: [],
+						latestUpdates: ["WEBUI_SECRET_KEY=dev-smoke-secret"],
+						retainedTailUpdates: [],
+						latestExchangeState: [],
+						terminalFinalAnswerEvidence: [],
+						latestSignals: [],
+						staleSignals: [],
+						criticalLiterals: [],
+					},
+				},
+			},
+		);
+
+		assert.doesNotMatch(prompt, /wl-copy/);
+		assert.doesNotMatch(prompt, /dev-smoke-secret/);
+		assert.doesNotMatch(prompt, /supersecretvalue/);
+		assert.match(prompt, /OPENWEBUI_ADMIN_PASSWORD=\[REDACTED\]/);
+		assert.match(prompt, /WEBUI_SECRET_KEY=\[REDACTED\]/);
+		assert.match(prompt, /\[REDACTED secret-retrieval command/);
+
+		const judgePrompt = buildJudgePrompt({
+			candidateSummary:
+				"Continuation card:\n- Current task: Continue.\n\nOPENWEBUI_ADMIN_PASSWORD=supersecretvalue",
+			snapshot,
+			continuation: {
+				turns: [
+					{
+						assistantText:
+							"grep '^OPENWEBUI_ADMIN_PASSWORD=' .env | cut -d= -f2- | wl-copy",
+						toolResults: [],
+					},
+				],
+			},
+		});
+		assert.doesNotMatch(judgePrompt, /wl-copy/);
+		assert.doesNotMatch(judgePrompt, /supersecretvalue/);
+		assert.match(judgePrompt, /OPENWEBUI_ADMIN_PASSWORD=\[REDACTED\]/);
+
+		const repairPrompt = buildRepairPrompt(
+			"OPENWEBUI_ADMIN_PASSWORD=supersecretvalue",
+			{
+				score: 2,
+				decision: "reject",
+				missing: [],
+				contradictions: [],
+				diagnosis: "secret exposed",
+			},
+			{
+				continuation: {
+					triggerEntryId: "a1",
+					turns: [
+						{
+							turnIndex: 1,
+							assistantText:
+								"grep '^OPENWEBUI_ADMIN_PASSWORD=' .env | cut -d= -f2- | wl-copy",
+							toolResults: [],
+						},
+					],
+				},
+			},
+		);
+		assert.doesNotMatch(repairPrompt, /wl-copy/);
+		assert.doesNotMatch(repairPrompt, /supersecretvalue/);
+		assert.match(repairPrompt, /OPENWEBUI_ADMIN_PASSWORD=\[REDACTED\]/);
 	});
 
 	it("caps model-visible conversation text while preserving artifact-backed manifest", () => {
@@ -269,18 +430,36 @@ describe("summary, judge, and repair", () => {
 			'{"score":8,"decision":"accept","currentState":7,"staleStateSuppression":6,"missing":[],"contradictions":[]}',
 		);
 		assert.equal(parsed.decision, "accept");
+		assert.equal(parsed.judgeStatus, "parsed");
 		assert.equal(parsed.currentState, 7);
 		assert.equal(parsed.staleStateSuppression, 6);
-		assert.equal(
-			parseJudgeResult(
-				'```json\n{"score":3,"decision":"reject","missing":["file"],"contradictions":[]}\n```',
-			).missing[0],
-			"file",
+		const contentReject = parseJudgeResult(
+			'```json\n{"score":3,"decision":"reject","missing":["file"],"contradictions":[]}\n```',
 		);
-		assert.equal(parseJudgeResult("not json").decision, "reject");
+		assert.equal(contentReject.judgeStatus, "parsed");
+		assert.equal(contentReject.missing[0], "file");
+		const invalidShapeReject = parseJudgeResult("```json\n123\n```");
+		assert.equal(invalidShapeReject.decision, "reject");
+		assert.equal(invalidShapeReject.judgeStatus, "parsed");
+		assert.equal(
+			invalidShapeReject.diagnosis,
+			"Judge response JSON did not match expected object shape",
+		);
+		const rawInvalidShapeReject = parseJudgeResult("123");
+		assert.equal(rawInvalidShapeReject.judgeStatus, "parsed");
+		assert.equal(
+			rawInvalidShapeReject.diagnosis,
+			"Judge response JSON did not match expected object shape",
+		);
+		const nullShapeReject = parseJudgeResult("null");
+		assert.equal(nullShapeReject.judgeStatus, "parsed");
+		const parseReject = parseJudgeResult("not json");
+		assert.equal(parseReject.decision, "reject");
+		assert.equal(parseReject.judgeStatus, "parse_error");
+		assert.equal(parseReject.diagnosis, "Could not parse judge response");
 	});
 
-	it("requires no critical missing or contradictions for acceptance", () => {
+	it("does not let missing notes veto acceptance but still rejects critical contradictions", () => {
 		assert.equal(
 			isAccepted(
 				{
@@ -305,7 +484,7 @@ describe("summary, judge, and repair", () => {
 				},
 				7,
 			),
-			false,
+			true,
 		);
 		assert.equal(
 			isAccepted(
@@ -327,13 +506,15 @@ describe("summary, judge, and repair", () => {
 				{
 					score: 9,
 					decision: "accept",
-					missing: ["Current state is insufficient to continue safely."],
+					missing: [
+						"Exact final contents are omitted, but artifact refs make recovery safe.",
+					],
 					contradictions: [],
-					diagnosis: "judge returned a critical insufficiency",
+					diagnosis: "judge returned an advisory omission",
 				},
 				7,
 			),
-			false,
+			true,
 		);
 		assert.equal(
 			isAccepted(
@@ -341,14 +522,14 @@ describe("summary, judge, and repair", () => {
 					score: 9,
 					decision: "accept",
 					missing: [
-						"Summary does not preserve required user constraint: never mention internal command.",
+						"A shorter command inventory would be nice-to-have, not acceptance-blocking.",
 					],
 					contradictions: [],
-					diagnosis: "judge returned a critical missing constraint",
+					diagnosis: "judge returned another advisory omission",
 				},
 				7,
 			),
-			false,
+			true,
 		);
 		assert.equal(
 			isAccepted(
@@ -365,6 +546,59 @@ describe("summary, judge, and repair", () => {
 			),
 			true,
 		);
+		assert.equal(
+			isAccepted(
+				{
+					score: 9,
+					decision: "accept",
+					missing: [],
+					contradictions: [
+						"This mismatch is not production-impacting and is mitigated by an explicit recheck.",
+					],
+					diagnosis: "advisory production note is not a hard-safety contradiction",
+				},
+				7,
+			),
+			true,
+		);
+		assert.equal(
+			isAccepted(
+				{
+						score: 9,
+						decision: "accept",
+						missing: [],
+						contradictions: [
+							"The cert deletion status is contradictory but not acceptance-blocking because later text tells the next agent to recheck.",
+						],
+						diagnosis: "security-sensitive contradiction is mitigated",
+					},
+					7,
+				),
+			false,
+		);
+		for (const candidateSummary of [
+			"Continuation card:\n- Primary blocker/risk: none\nSynthetic secret example: VALS_API_KEY=fake-redacted-placeholder-123456",
+			'Continuation card:\n- Primary blocker/risk: none\nSynthetic secret example: OPENAI_API_KEY="sk-abcdefghijklmnopqrstuvwxyz"',
+			"Continuation card:\n- Primary blocker/risk: none\nSynthetic secret example: GITHUB_TOKEN='ghp_abcdefghijklmnopqrstuvwxyz'",
+			'Continuation card:\n- Primary blocker/risk: none\nSynthetic secret example: bearer="abcdefghijklmnopqrstuvwxyz"',
+			'Continuation card:\n- Primary blocker/risk: none\nSynthetic secret example: certificate="MIIFAKECERTDATA0123456789"',
+			"Continuation card:\n- Primary blocker/risk: none\nSynthetic cert example:\n-----BEGIN CERTIFICATE-----\nMIIFAKECERTDATA0123456789\n-----END CERTIFICATE-----",
+		]) {
+			assert.equal(
+				isAccepted(
+					{
+						score: 9,
+						decision: "accept",
+						missing: [],
+						contradictions: [],
+						diagnosis: "summary is sufficient",
+					},
+					7,
+					candidateSummary,
+				),
+				false,
+			);
+		}
 		assert.equal(
 			isAccepted(
 				{
@@ -408,6 +642,9 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /Protected latest compacted updates/);
 		assert.match(prompt, /Protected latest verification and risk signals/);
 		assert.match(prompt, /verification_failure: npm test failed before repair/);
+		assert.match(prompt, /Live\/manual\/browser\/API\/integration\/smoke validation outranks unit tests/);
+		assert.match(prompt, /Do not penalize summaries for omitting exact passing unit-test commands/);
+		assert.match(prompt, /attribute failing checks only when evidence supports it/);
 		assert.match(prompt, /Protected artifact references/);
 		assert.match(prompt, /reserve gpt-5\.5 for manual checkpoints/);
 		assert.match(prompt, /artifact:\/\/raw/);
@@ -416,6 +653,11 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /current-state, next-action, constraint/);
 		assert.match(prompt, /stale\/superseded claims presented as current state/);
 		assert.match(prompt, /repair-driving omissions/);
+		assert.match(prompt, /unsafe, materially incomplete, or not production-ready/);
+		assert.match(prompt, /score 8 summaries may be accepted/);
+		assert.match(prompt, /secret-shaped values/);
+		assert.match(prompt, /auth, cert, key, deletion, or deploy state/);
+		assert.match(prompt, /advisory, non-blocking improvements/);
 		assert.match(prompt, /absent from the candidate summary text/);
 		assert.match(prompt, /unresolved contradictions/);
 	});
@@ -535,15 +777,29 @@ describe("summary, judge, and repair", () => {
 		);
 		assert.match(prompt, /Do not append an addendum/i);
 		assert.match(prompt, /Remove stale or superseded claims/i);
+		assert.match(prompt, /Only the Continuation card and narrative sections are authoritative/);
+		assert.match(prompt, /raw\/historical evidence/);
+		assert.match(prompt, /Redact secret-shaped values/);
+		assert.match(prompt, /auth\/cert\/key\/deletion\/deploy/);
+		assert.match(prompt, /model-facing handoff under roughly 100-150 lines/);
+		assert.match(prompt, /Do not include both a verbatim terminal answer and a synthesized restatement/);
+		assert.match(prompt, /flatten copied markdown headings/);
+		assert.match(prompt, /\| Check \| Status \| Freshness \| Relevance \|/);
+		assert.match(prompt, /one active-file list/);
 		assert.match(prompt, /## Trajectory Analysis/);
 		assert.match(prompt, /## Session Findings/);
-		assert.match(prompt, /exact heading "Continuation card:"/);
+		assert.match(prompt, /exact heading "Continuation card:" as the first line/);
+		assert.match(prompt, /if your draft starts with ## Goal or any deterministic capsule/);
 		assert.match(prompt, /Next tool action:/);
 		assert.match(prompt, /Stale branch to ignore:/);
 		assert.match(prompt, /Protected repair context/i);
 		assert.match(prompt, /repair needs current failing test/);
 		assert.match(prompt, /risk: repair needs current failing test/);
 		assert.match(prompt, /repair must preserve current failing test risk/);
+		assert.match(prompt, /Live\/manual\/browser\/API\/integration\/smoke validation/);
+		assert.match(prompt, /keep passing unit\/lint\/typecheck results terse/);
+		assert.match(prompt, /caused by this session, pre-existing, superseded, or unknown/);
+		assert.match(prompt, /Normalize ## Verification \/ Evidence into a compact table/);
 		assert.match(prompt, /artifact:\/\/git-diff-full-001\.patch/);
 		assert.match(prompt, /latest assistant update/);
 		assert.doesNotMatch(prompt, /RAW_DIFF_NOT_FOR_REPAIR_SENTINEL/);

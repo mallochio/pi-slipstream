@@ -863,6 +863,13 @@ function assistantHasToolCall(entry: MessageEntry): boolean {
 	);
 }
 
+function isSubstantiveAssistantResponse(entry: MessageEntry): boolean {
+	return (
+		isAssistantMessage(entry.message) &&
+		extractText(entry.message.content).trim().length > 0
+	);
+}
+
 function latestTerminalAssistantAfterLatestUser(
 	messageEntries: MessageEntry[],
 ): MessageEntry | null {
@@ -880,7 +887,7 @@ function latestTerminalAssistantAfterLatestUser(
 	let assistantResponseOffset = -1;
 	for (let index = afterUser.length - 1; index >= 0; index -= 1) {
 		const entry = afterUser[index];
-		if (entry && isAssistantMessage(entry.message)) {
+		if (entry && isSubstantiveAssistantResponse(entry)) {
 			assistantResponse = entry;
 			assistantResponseOffset = index;
 			break;
@@ -991,7 +998,7 @@ function mineLatestExchangeState(
 	let assistantResponseOffset = -1;
 	for (let index = afterUser.length - 1; index >= 0; index -= 1) {
 		const entry = afterUser[index];
-		if (entry && isAssistantMessage(entry.message)) {
+		if (entry && isSubstantiveAssistantResponse(entry)) {
 			assistantResponse = entry;
 			assistantResponseOffset = index;
 			break;

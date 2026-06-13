@@ -1,3 +1,4 @@
+import { redactPromptSensitiveText } from "./redaction.ts";
 import type {
 	ContinuationSnapshot,
 	JudgeResult,
@@ -15,12 +16,22 @@ export type JudgePromptInput = {
 	stateEvidence?: StateEvidenceBundle;
 };
 
-const REJECT: JudgeResult = {
+const PARSE_REJECT: JudgeResult = {
 	score: 0,
 	decision: "reject",
+	judgeStatus: "parse_error",
 	missing: [],
 	contradictions: [],
 	diagnosis: "Could not parse judge response",
+};
+
+const INVALID_SHAPE_REJECT: JudgeResult = {
+	score: 0,
+	decision: "reject",
+	judgeStatus: "parsed",
+	missing: [],
+	contradictions: [],
+	diagnosis: "Judge response JSON did not match expected object shape",
 };
 
 function list(lines: string[]): string {
@@ -92,28 +103,30 @@ export function buildJudgePrompt(input: JudgePromptInput): string {
 	const artifactRefs = artifactRefsFor(input);
 	const continuation = continuationText(input);
 
-	return `You are the Slipstream continuation-quality reviewer. Score whether this single candidate summary is strong enough to be the only durable handoff for a capable next coding agent.
+	return redactPromptSensitiveText(`You are the Slipstream continuation-quality reviewer. Score whether this single candidate summary is strong enough to be the only durable handoff for a capable next coding agent.
 
 Use a strict continuation-probe rubric. Ask: what would the next agent get wrong if it only saw this summary plus the retained recent context? Do not judge whether the task solution is correct. Judge whether the summary preserves enough current-state, next-action, constraint, verification, risk, and artifact-grounding information to continue safely and effectively.
 
-A safe-but-weak summary should be rejected so Slipstream repairs it. Do not accept summaries that merely avoid catastrophe while losing important reasoning, stale-state boundaries, verification status, recovery handles, or next-action specificity.
+Be selective rather than globally harsh. Accept safe handoffs with advisory imperfections, but reject hard safety/current-state failures.
 
-Score harshly but fairly:
+Score fairly:
 - 10: exceptional; a next agent can continue with almost no rereading.
 - 9: strong; only minor non-blocking omissions. Accept.
-- 8: safe but materially improvable; reject for repair unless every material continuation detail is already present.
-- 7: barely safe; reject for repair.
+- 8: acceptable with warnings; score 8 summaries may be accepted when current state, next action, constraints, and blockers are clear, and remaining issues are advisory noise, stale capsule material clearly corrected by the authoritative Continuation card/narrative, or recoverable provenance gaps.
+- 7: barely safe or materially incomplete; reject for repair.
 - below 7: unsafe, misleading, or too incomplete.
 
 Return only JSON with: score 0-10, decision accept|reject, currentState, nextActionReadiness, constraintPreservation, riskAwareness, verificationAwareness, artifactGrounding, retrievability, knowledgeContinuity, staleStateSuppression, lowNoiseLowContradiction, planAlignment, statementSufficiency, nonContradiction, missing, contradictions, diagnosis.
-Set decision "accept" only when the summary is production-ready as a durable handoff and has no critical omissions or contradictions. The missing array is for repair-driving omissions: current protected facts that are needed for high-quality continuation and absent from the candidate summary text. The contradictions array is for unresolved contradictions, especially stale/superseded claims presented as current state. Put non-blocking nuance in diagnosis.
+Set decision "reject" when omissions or contradictions make continuation unsafe, materially incomplete, or not production-ready. Set decision "accept" when the handoff is safe to continue from, even if it has advisory warnings. If decision is "accept", missing may contain advisory, non-blocking improvements but must not contain omissions you intend as acceptance blockers. The missing array is for repair-driving omissions when decision is "reject" and advisory omissions when decision is "accept": current protected facts that are needed for high-quality continuation and absent from the candidate summary text. The contradictions array is for unresolved contradictions, especially stale/superseded claims presented as current state. Put non-blocking nuance in diagnosis.
+
+Hard-fail classes: reject any summary that contains secret-shaped values, API keys, tokens, passwords, private keys, certificates, or bearer values. Reject contradictions involving auth, cert, key, deletion, or deploy state even if another section later says to recheck. Reject wrong current dirty-state claims, terminal-vs-pending contradictions, or stale current-state claims when they can mislead the next agent's first action. Do not reject solely because a non-authoritative deterministic capsule contains noisy stale evidence if the Continuation card and narrative unambiguously mark it stale and give a safe next action.
 
 Evaluate these categories:
 - currentState: captures latest task status, decisions, and what changed.
 - nextActionReadiness: gives correct, specific next steps.
 - constraintPreservation: preserves user constraints, workflow constraints, and product-scope boundaries.
 - riskAwareness: preserves blockers, failed attempts, caveats, and watch-outs.
-- verificationAwareness: preserves tests/checks/evidence and what remains unverified.
+- verificationAwareness: prioritizes current verification by external realism. Live/manual/browser/API/integration/smoke validation outranks unit tests when it exercises the changed surface. Passing unit/lint/typecheck evidence should be terse; preserve actionable failing commands/errors and attribute failing checks only when evidence supports it. Do not penalize summaries for omitting exact passing unit-test commands or full unit-test inventories.
 - artifactGrounding: cites concrete files/commands/artifacts/entities without pointless inventories.
 - retrievability: lets a next agent recover exact state without rereading the whole transcript.
 - knowledgeContinuity: preserves non-obvious research findings, causal reasoning, reusable conclusions, and decision rationale.
@@ -175,7 +188,7 @@ ${input.candidateSummary}
 Continuation evidence:
 <continuation>
 ${continuation || "None"}
-</continuation>`;
+</continuation>`);
 }
 
 function numericField(
@@ -188,7 +201,7 @@ function numericField(
 }
 
 function normalizeJudge(value: unknown): JudgeResult {
-	if (typeof value !== "object" || value === null) return REJECT;
+	if (typeof value !== "object" || value === null) return INVALID_SHAPE_REJECT;
 	const raw = value as Record<string, unknown>;
 	const score = numericField(raw, "score") ?? 0;
 	const decision = raw.decision === "accept" ? "accept" : "reject";
@@ -203,6 +216,7 @@ function normalizeJudge(value: unknown): JudgeResult {
 	return {
 		score,
 		decision,
+		judgeStatus: "parsed",
 		planAlignment: numericField(raw, "planAlignment"),
 		statementSufficiency: numericField(raw, "statementSufficiency"),
 		nonContradiction: numericField(raw, "nonContradiction"),
@@ -224,15 +238,20 @@ function normalizeJudge(value: unknown): JudgeResult {
 
 export function parseJudgeResult(text: string): JudgeResult {
 	const trimmed = text.trim();
+	try {
+		return normalizeJudge(JSON.parse(trimmed) as unknown);
+	} catch {
+		// Continue with fenced or embedded-object recovery below.
+	}
 	const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
 	const jsonText =
 		fenced?.[1] ??
 		trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1);
-	if (!jsonText || jsonText === trimmed.slice(0, 0)) return REJECT;
+	if (!jsonText || jsonText === trimmed.slice(0, 0)) return PARSE_REJECT;
 	try {
 		return normalizeJudge(JSON.parse(jsonText) as unknown);
 	} catch {
-		return REJECT;
+		return PARSE_REJECT;
 	}
 }
 
@@ -242,17 +261,34 @@ function isNonBlockingJudgeNote(note: string): boolean {
 	);
 }
 
-export function isAccepted(result: JudgeResult, threshold: number): boolean {
-	const criticalMissing = result.missing.filter(
-		(note) => !isNonBlockingJudgeNote(note),
+function isHardSafetyJudgeNote(note: string): boolean {
+	return /\b(secret|api[-_ ]?key|token|password|private key|bearer|auth|cert|certificate|ssh key|delet(?:e|ed|ion)|deploy)\b/i.test(
+		note,
 	);
+}
+
+export function hasSecretShapedValue(text: string): boolean {
+	return /-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)-----/i.test(text) ||
+		/\bBearer\s+(?!\[?REDACTED\]?|<redacted>|redacted\b)[A-Za-z0-9._~+/=-]{16,}/i.test(
+			text,
+		) ||
+		/\b[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY|BEARER|CERTIFICATE|CERT)[A-Z0-9_]*\s*[:=]\s*(?:"(?!\[?REDACTED\]?|<redacted>|redacted\b)[^"\s]{8,}"|'(?!\[?REDACTED\]?|<redacted>|redacted\b)[^'\s]{8,}'|`(?!\[?REDACTED\]?|<redacted>|redacted\b)[^`\s]{8,}`|(?!\[?REDACTED\]?|<redacted>|redacted\b)[^\s'"`]{8,})/i.test(
+			text,
+		);
+}
+
+export function isAccepted(
+	result: JudgeResult,
+	threshold: number,
+	candidateSummary = "",
+): boolean {
+	if (hasSecretShapedValue(candidateSummary)) return false;
 	const criticalContradictions = result.contradictions.filter(
-		(note) => !isNonBlockingJudgeNote(note),
+		(note) => isHardSafetyJudgeNote(note) || !isNonBlockingJudgeNote(note),
 	);
 	return (
 		result.decision === "accept" &&
 		result.score >= threshold &&
-		criticalMissing.length === 0 &&
 		criticalContradictions.length === 0
 	);
 }

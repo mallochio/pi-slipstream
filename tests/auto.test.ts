@@ -1486,7 +1486,8 @@ describe("auto Slipstream lifecycle", () => {
 					rejectedSummaryMode: "accept" as const,
 					repairAttempts: 1,
 				},
-				completeSummary: async () => "## Goal\nStill below threshold",
+				completeSummary: async () =>
+					"Continuation card:\n- Current task: Still below threshold\n\n## Goal\nStill below threshold",
 				completeJudge: async () => ({
 					score: 4,
 					decision: "reject",
@@ -1499,9 +1500,10 @@ describe("auto Slipstream lifecycle", () => {
 
 			assert.equal(accepted, true);
 			assert.equal(state.status, "ready_to_adopt");
+			assert.match(state.pending?.summary ?? "", /^Continuation card:/);
 			assert.match(
 				state.pending?.summary ?? "",
-				/^## Deterministic Current-State Capsule/,
+				/## Deterministic Evidence Capsule/,
 			);
 			assert.equal(state.pending?.details.rejectedSummaryAccepted, true);
 			assert.equal(state.pending?.details.rejectedSummaryMode, "accept");
@@ -1611,7 +1613,7 @@ describe("auto Slipstream lifecycle", () => {
 				}),
 				completeSummary: async (prompt) => {
 					summaryPrompt = prompt;
-					return "## Goal\nBuild";
+					return "Continuation card:\n- Current task: Build\n\n## Goal\nBuild";
 				},
 			});
 			assert.ok(job);
@@ -1627,7 +1629,8 @@ describe("auto Slipstream lifecycle", () => {
 			const accepted = await finalizeAutoJob({
 				state,
 				config: config(),
-				completeSummary: async () => "## Goal\nRepaired",
+				completeSummary: async () =>
+					"Continuation card:\n- Current task: Build\n\n## Goal\nBuild",
 				completeJudge: async (prompt) => {
 					judgePrompt = prompt;
 					return {
@@ -1646,11 +1649,12 @@ describe("auto Slipstream lifecycle", () => {
 			assert.match(judgePrompt, /Use Slipstream/);
 			assert.match(judgePrompt, /Protected distilled state evidence/);
 			assert.doesNotMatch(judgePrompt, /Bounded git diff -U20/);
+			assert.match(state.pending?.summary ?? "", /^Continuation card:/);
+			assert.match(state.pending?.summary ?? "", /## Goal\nBuild/);
 			assert.match(
 				state.pending?.summary ?? "",
-				/^## Deterministic Current-State Capsule/,
+				/## Deterministic Evidence Capsule/,
 			);
-			assert.match(state.pending?.summary ?? "", /## Goal\nBuild/);
 			assert.equal(state.pending?.validatedThroughEntryId, "a6");
 			assert.equal(
 				shouldActivatePreparedCompactionOnTurn(

@@ -631,6 +631,32 @@ describe("snapshot", () => {
 		);
 	});
 
+	it("does not treat a blank assistant placeholder as a response to the latest user", () => {
+		const entries = [
+			msg("u1", { role: "user", content: "please review the current state" }),
+			msg("a1", { role: "assistant", content: "" }),
+		];
+
+		const snapshot = buildSnapshot({
+			branchEntries: entries,
+			keepRecentEntryCount: 2,
+		});
+
+		assert.equal(
+			snapshot.manifest.latestExchangeState.some((signal) =>
+				signal.includes("has no subsequent assistant response"),
+			),
+			true,
+		);
+		assert.equal(
+			snapshot.manifest.latestExchangeState.some((signal) =>
+				signal.includes("has a subsequent assistant response"),
+			),
+			false,
+		);
+		assert.equal(snapshot.manifest.terminalFinalAnswerEvidence.length, 0);
+	});
+
 	it("protects exact terminal assistant final-answer evidence beyond retained-tail truncation", () => {
 		const longSetup = "Context line. ".repeat(90);
 		const entries = [
