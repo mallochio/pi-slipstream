@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
 	appendFile,
 	mkdir,
+	mkdtemp,
 	readFile,
 	rename,
 	unlink,
@@ -349,8 +350,18 @@ export class ArtifactStore {
 
 	async createRun(input: ArtifactRunInput): Promise<ArtifactRun> {
 		const id = createRunId(input.sessionId, input.triggerEntryId);
-		const dir = join(this.root, `${sanitizePart(input.sessionId)}-${id}`);
-		await mkdir(dir, { recursive: true });
+		const baseDir = join(this.root, `${sanitizePart(input.sessionId)}-${id}`);
+		await mkdir(this.root, { recursive: true });
+		let dir = baseDir;
+		try {
+			await mkdir(baseDir);
+		} catch (error) {
+			if (
+				!(error instanceof Error && "code" in error && error.code === "EEXIST")
+			)
+				throw error;
+			dir = await mkdtemp(`${baseDir}-`);
+		}
 		await writeFile(
 			join(dir, "run.json"),
 			`${JSON.stringify({ id, sessionId: input.sessionId, triggerEntryId: input.triggerEntryId, cwd: input.cwd }, null, 2)}\n`,

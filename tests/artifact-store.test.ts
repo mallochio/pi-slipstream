@@ -26,6 +26,49 @@ class YieldCheckedJsonValue {
 }
 
 describe("artifact store", () => {
+	it("allocates distinct artifact directories for duplicate session/trigger runs", async () => {
+		const parent = join(process.cwd(), ".scratch", "test-tmp");
+		await mkdir(parent, { recursive: true });
+		const root = await mkdtemp(join(parent, "slipstream-artifacts-"));
+		try {
+			const store = new ArtifactStore({
+				root,
+				maxChunkBytes: 20,
+				maxTotalBytes: 1_000,
+			});
+			const firstRun = await store.createRun(SAMPLE);
+			const secondRun = await store.createRun(SAMPLE);
+
+			assert.equal(
+				firstRun.id,
+				createRunId(SAMPLE.sessionId, SAMPLE.triggerEntryId),
+			);
+			assert.equal(secondRun.id, firstRun.id);
+			assert.notEqual(secondRun.dir, firstRun.dir);
+
+			const [firstSnapshot, secondSnapshot] = await Promise.all([
+				store.writeTriggerSnapshot(firstRun, {
+					messages: ["first".repeat(10)],
+					manifest: {},
+				}),
+				store.writeTriggerSnapshot(secondRun, {
+					messages: ["second".repeat(10)],
+					manifest: {},
+				}),
+			]);
+
+			assert.notDeepEqual(firstSnapshot.chunkPaths, secondSnapshot.chunkPaths);
+			for (const path of [
+				...firstSnapshot.chunkPaths,
+				...secondSnapshot.chunkPaths,
+			]) {
+				assert.equal((await readFile(path, "utf8")).length > 0, true);
+			}
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("writes sanitized, chunked artifacts and index records", async () => {
 		const parent = join(process.cwd(), ".scratch", "test-tmp");
 		await mkdir(parent, { recursive: true });

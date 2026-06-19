@@ -1503,8 +1503,12 @@ describe("commands", () => {
 		assert.equal(state.pending, null);
 	});
 
-	it("offers manual acceptance for a rejected prepared summary", async () => {
+	it("offers manual acceptance for a rejected prepared summary", async (t) => {
 		const state = createRuntimeState({ now: 100 });
+		const artifactRoot = mkdtempSync(
+			join(process.cwd(), ".scratch", "test-tmp", "command-manual-accept-"),
+		);
+		t.after(() => rmSync(artifactRoot, { recursive: true, force: true }));
 		const config = {
 			...DEFAULT_CONFIG,
 			rejectedSummaryMode: "ask" as const,
@@ -1512,7 +1516,7 @@ describe("commands", () => {
 			judgeThreshold: 9,
 			repairAttempts: 1,
 			pendingTtlMs: 10_000,
-			artifactRoot: ".scratch/test-tmp/command-manual-accept",
+			artifactRoot,
 		};
 		let confirmMessage = "";
 		let confirmTimeout: number | undefined;
