@@ -92,6 +92,65 @@ function addUnique(target: string[], value: string | null): void {
 	if (!target.includes(value)) target.push(value);
 }
 
+function boundedMatchWindow(
+	text: string,
+	matchIndex: number,
+	maxChars: number,
+): string {
+	const sentence = sentenceWindow(text, matchIndex);
+	if (sentence.length <= maxChars) return sentence;
+	const start = Math.max(0, matchIndex - Math.floor(maxChars * 0.35));
+	return text.slice(start, start + maxChars).trim();
+}
+
+function globalMatcher(pattern: RegExp): RegExp {
+	return new RegExp(
+		pattern.source,
+		pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`,
+	);
+}
+
+function intentExcerpts(text: string, pattern: RegExp): string[] {
+	const normalized = text.replace(/\\n/g, "\n");
+	const excerpts: string[] = [];
+	const matcher = globalMatcher(pattern);
+	let match: RegExpExecArray | null;
+	while ((match = matcher.exec(normalized))) {
+		addUnique(excerpts, boundedMatchWindow(normalized, match.index, 220));
+		if (excerpts.length >= 3) break;
+		if (match[0].length === 0) matcher.lastIndex += 1;
+	}
+	return excerpts;
+}
+
+const MINED_USER_INTENT_OMISSION_MARKER =
+	"\n\n[... Slipstream omitted source text from oversized mined user intent. ...]";
+
+function boundWithOmissionMarker(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	const marker = MINED_USER_INTENT_OMISSION_MARKER;
+	if (maxChars <= marker.length) return marker.slice(0, maxChars);
+	const available = maxChars - marker.length;
+	const headChars = Math.floor(available * 0.65);
+	const tailChars = available - headChars;
+	const tail = tailChars > 0 ? text.slice(-tailChars) : "";
+	return `${text.slice(0, headChars)}${marker}${tail}`;
+}
+
+function boundManifestFactText(
+	text: string,
+	pattern: RegExp,
+	maxChars = 1_000,
+): string {
+	if (text.length <= maxChars) return text;
+	const excerpts = intentExcerpts(text, pattern);
+	if (excerpts.length === 0) return boundWithOmissionMarker(text, maxChars);
+	return boundWithOmissionMarker(
+		`Selected intent excerpts from oversized user message:\n${excerpts.map((excerpt) => `- ${excerpt}`).join("\n")}${MINED_USER_INTENT_OMISSION_MARKER}`,
+		maxChars,
+	);
+}
+
 function addRecentVerification(
 	manifest: SnapshotManifest,
 	verificationIndex: Map<string, number>,
@@ -370,12 +429,18 @@ function mineTextFacts(
 		if (message.role === "user") {
 			const text = extractText(message.content).trim();
 			if (decisionRe.test(text))
-				manifest.userDecisions.push({ text, entryId: entry.id });
+				manifest.userDecisions.push({
+					text: boundManifestFactText(text, decisionRe),
+					entryId: entry.id,
+				});
 			if (constraintRe.test(text))
-				manifest.constraints.push({ text, entryId: entry.id });
+				manifest.constraints.push({
+					text: boundManifestFactText(text, constraintRe),
+					entryId: entry.id,
+				});
 			if (loopRe.test(text))
 				manifest.openLoops.push({
-					summary: text,
+					summary: boundManifestFactText(text, loopRe),
 					entryId: entry.id,
 					priority: /blocked|must|next step/i.test(text) ? "high" : "medium",
 				});

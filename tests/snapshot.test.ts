@@ -5,6 +5,7 @@ import {
 	buildSnapshotAsync,
 	extractText,
 } from "../src/snapshot.ts";
+import { buildSummaryPrompt } from "../src/summary.ts";
 import type { AgentMessage, SessionEntry, Snapshot } from "../src/types.ts";
 
 function msg(id: string, message: AgentMessage): SessionEntry {
@@ -291,6 +292,37 @@ describe("snapshot", () => {
 			snapshot.manifest.openLoops.some((l) => l.summary.includes("Next step")),
 			true,
 		);
+	});
+
+	it("caps mined user intent text before storing protected manifest facts", () => {
+		const middleConstraint = "Critical middle instruction: Must use WAL mode.";
+		const hugeUserText = `Use Slipstream primary. Only use mature libs. Next step is implementation. ${"X".repeat(350_000)} ${middleConstraint} ${"X".repeat(350_000)} END_MARKER`;
+		const snapshot = buildSnapshot({
+			branchEntries: [msg("u1", { role: "user", content: hugeUserText })],
+			keepRecentEntryCount: 0,
+		});
+
+		const minedTexts = [
+			...snapshot.manifest.userDecisions.map((decision) => decision.text),
+			...snapshot.manifest.constraints.map((constraint) => constraint.text),
+			...snapshot.manifest.openLoops.map((loop) => loop.summary),
+		];
+		assert.equal(minedTexts.length, 3);
+		for (const text of minedTexts) {
+			assert.equal(text.length <= 1_000, true);
+			assert.match(text, /Slipstream omitted/);
+		}
+		assert.equal(
+			snapshot.manifest.constraints.some((constraint) =>
+				constraint.text.includes(middleConstraint),
+			),
+			true,
+		);
+		const prompt = buildSummaryPrompt(snapshot, {
+			maxConversationChars: 0,
+			maxPromptChars: 20_000,
+		});
+		assert.match(prompt, /Critical middle instruction: Must use WAL mode/);
 	});
 
 	it("protects exact critical literals from tests and tool output", () => {
