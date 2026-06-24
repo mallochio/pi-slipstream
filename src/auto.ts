@@ -22,6 +22,8 @@ import type {
 	CompleteJudgeFn,
 	CompleteTextFn,
 	ContextUsageSnapshot,
+	JudgeCompletion,
+	JudgeResult,
 	ProgressSink,
 	RuntimeState,
 	SessionEntry,
@@ -69,6 +71,22 @@ export function isAutoTriggerBoundary(message: AgentMessage): boolean {
 
 function elapsedMs(startedAt: number): number {
 	return Math.max(0, Date.now() - startedAt);
+}
+
+function isJudgeCompletion(
+	value: JudgeResult | JudgeCompletion,
+): value is JudgeCompletion {
+	return "result" in value;
+}
+
+function normalizeJudgeCompletion(
+	completion: JudgeResult | JudgeCompletion,
+): JudgeCompletion {
+	return isJudgeCompletion(completion) ? completion : { result: completion };
+}
+
+function isJudgeParseError(judge: JudgeResult): boolean {
+	return judge.judgeStatus === "parse_error";
 }
 
 function yieldBeforeHeavyAutoWork(): Promise<void> {
@@ -391,11 +409,6 @@ export async function finalizeAutoJob(
 		};
 		let generatedSummary = await job.summaryPromise;
 		if (isInvalidated()) return false;
-		input.state.status = "judging";
-		input.onProgress?.({
-			phase: "judging",
-			message: "Judging auto candidate summary",
-		});
 		await yieldBeforeHeavyAutoWork();
 		let summary = withCurrentStateCapsule(
 			generatedSummary,
@@ -439,29 +452,86 @@ export async function finalizeAutoJob(
 				artifactRefs: [...job.snapshot.manifest.artifactRefs, job.artifactDir],
 			},
 		};
+		const completeJudgeWithRetry = async (
+			promptInput: Parameters<typeof buildJudgePrompt>[0],
+			message: string,
+		): Promise<JudgeResult | null> => {
+			input.state.status = "judging";
+			input.onProgress?.({ phase: "judging", message });
+			await yieldBeforeHeavyAutoWork();
+			const judgePrompt = buildJudgePrompt(promptInput);
+			await store.writePromptMetrics(run, {
+				kind: "judge-prompt",
+				chars: judgePrompt.length,
+			});
+			if (isInvalidated()) return null;
+			const completion = normalizeJudgeCompletion(
+				await input.completeJudge(judgePrompt, input.signal),
+			);
+			if (completion.rawText && isJudgeParseError(completion.result)) {
+				await store.writeJudgeRawResponse(run, {
+					attempt: "auto-initial",
+					rawText: completion.rawText,
+				});
+			}
+			if (isInvalidated()) return null;
+			if (!isJudgeParseError(completion.result)) return completion.result;
+
+			input.onProgress?.({
+				phase: "judging",
+				message:
+					"Retrying auto judge after parse_error with minimized continuation evidence",
+				lastScore: completion.result.score,
+			});
+			await yieldBeforeHeavyAutoWork();
+			const retryPrompt = buildJudgePrompt(promptInput, {
+				continuationMaxChars: 1_000,
+			});
+			await store.writePromptMetrics(run, {
+				kind: "judge-retry-prompt",
+				chars: retryPrompt.length,
+			});
+			if (isInvalidated()) return null;
+			const retry = normalizeJudgeCompletion(
+				await input.completeJudge(retryPrompt, input.signal),
+			);
+			if (retry.rawText && isJudgeParseError(retry.result)) {
+				await store.writeJudgeRawResponse(run, {
+					attempt: "auto-retry",
+					rawText: retry.rawText,
+				});
+			}
+			if (isInvalidated()) return null;
+			return retry.result;
+		};
+
 		const judgingStartedAt = Date.now();
-		let judge = await input.completeJudge(
-			buildJudgePrompt({
+		const initialJudge = await completeJudgeWithRetry(
+			{
 				candidateSummary: summary,
 				snapshot: judgeSnapshot,
 				continuation,
 				artifactRefs: job.summaryArtifactRefs,
 				stateEvidence: job.stateEvidence,
-			}),
-			input.signal,
+			},
+			"Judging auto candidate summary",
 		);
-		if (isInvalidated()) return false;
+		if (!initialJudge) return false;
+		let judge = initialJudge;
 		job.stats.timingsMs.judging = elapsedMs(judgingStartedAt);
 		const threshold = input.config.judgeThreshold;
 		let bestAcceptedSummary = isAccepted(judge, threshold, summary)
 			? summary
 			: null;
-		let bestAcceptedJudge = isAccepted(judge, threshold, summary) ? judge : null;
+		let bestAcceptedJudge = isAccepted(judge, threshold, summary)
+			? judge
+			: null;
 		let repaired = false;
 		const repairStartedAt = Date.now();
 		for (
 			let attempt = 0;
 			attempt < input.config.repairAttempts &&
+			!isJudgeParseError(judge) &&
 			!isAccepted(judge, threshold, summary);
 			attempt += 1
 		) {
@@ -499,23 +569,18 @@ export async function finalizeAutoJob(
 			);
 			await store.writeCandidate(run, summary);
 			if (isInvalidated()) return false;
-			input.state.status = "judging";
-			input.onProgress?.({
-				phase: "judging",
-				message: "Judging repaired auto summary",
-			});
-			await yieldBeforeHeavyAutoWork();
-			judge = await input.completeJudge(
-				buildJudgePrompt({
+			const repairedJudge = await completeJudgeWithRetry(
+				{
 					candidateSummary: summary,
 					snapshot: judgeSnapshot,
 					continuation,
 					artifactRefs: job.summaryArtifactRefs,
 					stateEvidence: job.stateEvidence,
-				}),
-				input.signal,
+				},
+				"Judging repaired auto summary",
 			);
-			if (isInvalidated()) return false;
+			if (!repairedJudge) return false;
+			judge = repairedJudge;
 			if (
 				isAccepted(judge, threshold, summary) &&
 				(bestAcceptedJudge === null || judge.score > bestAcceptedJudge.score)

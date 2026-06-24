@@ -1,4 +1,11 @@
 import { fullDiffRecoveryStatus } from "./diff-recovery.ts";
+import {
+	DEFAULT_MAX_REPAIR_PROMPT_CHARS,
+	fitPromptWithDegradableSection,
+	normalizePromptBudgetOptions,
+	renderBoundedContinuationEvidence,
+	type PromptBudgetOptions,
+} from "./prompt-bounds.ts";
 import { redactPromptSensitiveText } from "./redaction.ts";
 import type {
 	ContinuationSnapshot,
@@ -60,20 +67,17 @@ ${list(evidence.session.criticalLiterals)}`;
 
 function repairContinuation(
 	continuation: ContinuationSnapshot | undefined,
+	options: { maxChars: number; mode?: "standard" | "minimal" | "none" },
 ): string {
 	if (!continuation || continuation.turns.length === 0) return "None";
-	return continuation.turns
-		.map(
-			(turn, index) =>
-				`Turn ${index + 1}: ${turn.assistantText}\nTool results: ${JSON.stringify(turn.toolResults)}`,
-		)
-		.join("\n\n");
+	return renderBoundedContinuationEvidence(continuation, options);
 }
 
-export function buildRepairPrompt(
+function renderRepairPrompt(
 	summary: string,
 	judge: JudgeResult,
-	context: RepairPromptContext = {},
+	context: RepairPromptContext,
+	continuation: string,
 ): string {
 	return redactPromptSensitiveText(`Rewrite the full summary into a clean revised checkpoint. Do not append an addendum. Do not modify, reinterpret, or overwrite raw artifact truth.
 
@@ -132,11 +136,44 @@ ${list(context.artifactRefs ?? [])}
 
 Continuation evidence:
 <continuation>
-${repairContinuation(context.continuation)}
+${continuation}
 </continuation>
 
 Summary to rewrite:
 <summary>
 ${summary}
 </summary>`);
+}
+
+export function buildRepairPrompt(
+	summary: string,
+	judge: JudgeResult,
+	context: RepairPromptContext = {},
+	options?: PromptBudgetOptions,
+): string {
+	const budget = normalizePromptBudgetOptions(
+		options,
+		DEFAULT_MAX_REPAIR_PROMPT_CHARS,
+	);
+	const standardContinuation = repairContinuation(context.continuation, {
+		maxChars: budget.continuationMaxChars,
+		mode: "standard",
+	});
+	const minimalContinuation = repairContinuation(context.continuation, {
+		maxChars: Math.min(budget.continuationMaxChars, 8_000),
+		mode: "minimal",
+	});
+	const omittedContinuation = repairContinuation(context.continuation, {
+		maxChars: 1_000,
+		mode: "none",
+	});
+	return fitPromptWithDegradableSection({
+		render: (continuation) =>
+			renderRepairPrompt(summary, judge, context, continuation),
+		degradableStandard: standardContinuation,
+		degradableMinimal: minimalContinuation,
+		degradableOmitted: omittedContinuation,
+		maxPromptChars: budget.maxPromptChars,
+		fixedSectionName: "repair prompt",
+	});
 }

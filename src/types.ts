@@ -369,7 +369,11 @@ export type CompleteTextFn = (
 	prompt: string,
 	signal?: AbortSignal,
 ) => Promise<string>;
+export type JudgeCompletion = {
+	result: JudgeResult;
+	rawText?: string;
+};
 export type CompleteJudgeFn = (
 	prompt: string,
 	signal?: AbortSignal,
-) => Promise<JudgeResult>;
+) => Promise<JudgeResult | JudgeCompletion>;

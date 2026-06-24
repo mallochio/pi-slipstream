@@ -547,6 +547,35 @@ export class ArtifactStore {
 		return { path };
 	}
 
+	async writeJudgeRawResponse(
+		run: ArtifactRun,
+		input: { attempt: string; rawText: string; maxChars?: number },
+	): Promise<{ path: string }> {
+		const maxChars = input.maxChars ?? 20_000;
+		const rawText =
+			input.rawText.length <= maxChars
+				? input.rawText
+				: `${input.rawText.slice(0, Math.floor(maxChars / 2))}\n...[omitted ${input.rawText.length - maxChars} chars]...\n${input.rawText.slice(-Math.ceil(maxChars / 2))}`;
+		const path = join(run.dir, `judge-raw-${sanitizePart(input.attempt)}.json`);
+		await writeFile(
+			path,
+			`${JSON.stringify(
+				{
+					attempt: input.attempt,
+					rawChars: input.rawText.length,
+					sha256: createHash("sha256").update(input.rawText).digest("hex"),
+					truncated: rawText.length !== input.rawText.length,
+					rawText,
+				},
+				null,
+				2,
+			)}\n`,
+			"utf8",
+		);
+		await appendIndex(run.dir, { kind: "judge-raw-response", path });
+		return { path };
+	}
+
 	async writeAdoptionRecord(
 		run: ArtifactRun,
 		adoption: unknown,

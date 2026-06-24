@@ -134,8 +134,8 @@ export function createJudgeCompleter(
 	ctx: ModelContext,
 	configuredModel?: string,
 ): CompleteJudgeFn {
-	return async (prompt, signal) =>
-		parseJudgeResult(
-			await completePrompt(ctx, configuredModel, prompt, signal),
-		);
+	return async (prompt, signal) => {
+		const rawText = await completePrompt(ctx, configuredModel, prompt, signal);
+		return { rawText, result: parseJudgeResult(rawText) };
+	};
 }

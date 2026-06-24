@@ -529,6 +529,98 @@ describe("pipeline", () => {
 		}
 	});
 
+	it("retries parse-error judge once and does not repair the summary first", async () => {
+		const root = await makeRoot();
+		try {
+			let summaryCalls = 0;
+			let judgeCalls = 0;
+			const judgePromptLengths: number[] = [];
+			const progress: string[] = [];
+			const result = await runValidatedSlipstream({
+				branchEntries: [
+					user("u1", "Use Slipstream and keep PARSE_ERROR_SENTINEL."),
+					assistant("a1", "implementation done"),
+				],
+				sessionId: "s-parse-error-retry",
+				cwd: "/repo",
+				artifactRoot: root,
+				continuation: {
+					triggerEntryId: "a1",
+					turns: [
+						{
+							turnIndex: 1,
+							assistantText: "implementation done",
+							toolResults: [
+								{
+									toolName: "retool",
+									isError: false,
+									text: "X".repeat(120_000),
+								},
+							],
+						},
+					],
+				},
+				repairAttempts: 3,
+				onProgress: (event) =>
+					progress.push(`${event.phase}: ${event.message}`),
+				completeSummary: async (prompt) => {
+					summaryCalls += 1;
+					assert.doesNotMatch(prompt, /Rewrite the full summary/);
+					return "## Goal\nContinue safely with PARSE_ERROR_SENTINEL.";
+				},
+				completeJudge: async (prompt) => {
+					judgeCalls += 1;
+					judgePromptLengths.push(prompt.length);
+					assert.equal(prompt.length < 650_000, true);
+					assert.match(prompt, /PARSE_ERROR_SENTINEL/);
+					return {
+						rawText: `not json attempt ${judgeCalls}`,
+						result: {
+							score: 0,
+							decision: "reject",
+							judgeStatus: "parse_error",
+							missing: [],
+							contradictions: [],
+							diagnosis: "Could not parse judge response",
+						},
+					};
+				},
+			});
+
+			assert.equal(result.accepted, false);
+			assert.equal(result.repaired, false);
+			assert.equal(summaryCalls, 1);
+			assert.equal(judgeCalls, 2);
+			assert.equal(judgePromptLengths.length, 2);
+			const initialJudgePromptLength = judgePromptLengths[0];
+			const retryJudgePromptLength = judgePromptLengths[1];
+			if (
+				initialJudgePromptLength === undefined ||
+				retryJudgePromptLength === undefined
+			) {
+				throw new Error("expected initial and retry judge prompt lengths");
+			}
+			assert.equal(retryJudgePromptLength < initialJudgePromptLength, true);
+			assert.match(progress.join("\n"), /Retrying judge after parse_error/);
+			assert.doesNotMatch(progress.join("\n"), /Repair attempt/);
+			const index = JSON.parse(
+				await readFile(`${result.artifactDir}/index.json`, "utf8"),
+			) as { records: Array<{ kind: string; path?: string }> };
+			const rawJudgeRecords = index.records.filter(
+				(record) => record.kind === "judge-raw-response",
+			);
+			assert.equal(rawJudgeRecords.length, 2);
+			const rawJudge = JSON.parse(
+				await readFile(rawJudgeRecords[0]?.path ?? "", "utf8"),
+			) as { rawText: string; rawChars: number; sha256: string };
+			assert.match(rawJudge.rawText, /not json attempt 1/);
+			assert.equal(rawJudge.rawChars, "not json attempt 1".length);
+			assert.match(rawJudge.sha256, /^[a-f0-9]{64}$/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("repairs before adoption when candidate omits a protected latest update", async () => {
 		const root = await makeRoot();
 		try {

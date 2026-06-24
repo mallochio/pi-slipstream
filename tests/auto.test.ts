@@ -1297,6 +1297,129 @@ describe("auto Slipstream lifecycle", () => {
 		}
 	});
 
+	it("retries auto parse-error judge once and does not repair first", async () => {
+		const parent = join(process.cwd(), ".scratch", "test-tmp");
+		await mkdir(parent, { recursive: true });
+		const root = await mkdtemp(join(parent, "slipstream-auto-parse-error-"));
+		try {
+			const state = createRuntimeState();
+			let summaryCalls = 0;
+			let judgeCalls = 0;
+			const judgePromptLengths: number[] = [];
+			const progress: string[] = [];
+			const job = await startAutoJob({
+				state,
+				config: { ...config(), repairAttempts: 3 },
+				branchEntries: [
+					msg("u1", { role: "user", content: "Use Slipstream." }),
+					msg("a1", { role: "assistant", content: "implementation done" }),
+				],
+				sessionId: "s-auto-parse-error",
+				cwd: "/repo",
+				artifactRoot: root,
+				executeGit: async () => ({ stdout: "", stderr: "" }),
+				onProgress: (event) =>
+					progress.push(`${event.phase}: ${event.message}`),
+				completeSummary: async (prompt) => {
+					summaryCalls += 1;
+					assert.doesNotMatch(prompt, /Rewrite the full summary/);
+					return "## Goal\nContinue safely with AUTO_PARSE_ERROR_SENTINEL.";
+				},
+			});
+			assert.ok(job);
+			await job.summaryPromise;
+			job.continuation.appendTurn({
+				turnIndex: 1,
+				message: { role: "assistant", content: "auto continuation" },
+				toolResults: [
+					{
+						role: "toolResult",
+						toolName: "retool",
+						toolCallId: "tool-huge",
+						isError: false,
+						content: "X".repeat(120_000),
+					},
+				],
+			});
+
+			const accepted = await finalizeAutoJob({
+				state,
+				config: {
+					...config(),
+					repairAttempts: 3,
+					rejectedSummaryMode: "reject",
+				},
+				completeSummary: async (prompt) => {
+					summaryCalls += 1;
+					assert.doesNotMatch(prompt, /Rewrite the full summary/);
+					return "unexpected repair";
+				},
+				completeJudge: async (prompt) => {
+					judgeCalls += 1;
+					judgePromptLengths.push(prompt.length);
+					assert.equal(prompt.length < 650_000, true);
+					assert.match(prompt, /AUTO_PARSE_ERROR_SENTINEL/);
+					return {
+						rawText: `not json auto attempt ${judgeCalls}`,
+						result: {
+							score: 0,
+							decision: "reject",
+							judgeStatus: "parse_error",
+							missing: [],
+							contradictions: [],
+							diagnosis: "Could not parse judge response",
+						},
+					};
+				},
+				now: () => 100,
+				onProgress: (event) =>
+					progress.push(`${event.phase}: ${event.message}`),
+			});
+
+			assert.equal(accepted, false);
+			assert.equal(summaryCalls, 1);
+			assert.equal(judgeCalls, 2);
+			assert.equal(judgePromptLengths.length, 2);
+			const initialJudgePromptLength = judgePromptLengths[0];
+			const retryJudgePromptLength = judgePromptLengths[1];
+			if (
+				initialJudgePromptLength === undefined ||
+				retryJudgePromptLength === undefined
+			) {
+				throw new Error("expected initial and retry judge prompt lengths");
+			}
+			assert.equal(retryJudgePromptLength < initialJudgePromptLength, true);
+			assert.match(
+				progress.join("\n"),
+				/Retrying auto judge after parse_error/,
+			);
+			assert.doesNotMatch(progress.join("\n"), /Auto repair attempt/);
+			assert.equal(state.pending, null);
+			assert.equal(state.status, "rejected");
+			const index = JSON.parse(
+				await readFile(`${job.artifactDir}/index.json`, "utf8"),
+			) as { records: Array<{ kind: string; path?: string }> };
+			const rawJudgeRecords = index.records.filter(
+				(record) => record.kind === "judge-raw-response",
+			);
+			assert.equal(rawJudgeRecords.length, 2);
+			const rawJudge = JSON.parse(
+				await readFile(rawJudgeRecords[0]?.path ?? "", "utf8"),
+			) as {
+				attempt: string;
+				rawText: string;
+				rawChars: number;
+				sha256: string;
+			};
+			assert.equal(rawJudge.attempt, "auto-initial");
+			assert.match(rawJudge.rawText, /not json auto attempt 1/);
+			assert.equal(rawJudge.rawChars, "not json auto attempt 1".length);
+			assert.match(rawJudge.sha256, /^[a-f0-9]{64}$/);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("strict judge repairs low-quality auto summaries before storing pending state", async () => {
 		const parent = join(process.cwd(), ".scratch", "test-tmp");
 		await mkdir(parent, { recursive: true });

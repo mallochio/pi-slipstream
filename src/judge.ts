@@ -1,3 +1,10 @@
+import {
+	DEFAULT_MAX_JUDGE_PROMPT_CHARS,
+	fitPromptWithDegradableSection,
+	normalizePromptBudgetOptions,
+	renderBoundedContinuationEvidence,
+	type PromptBudgetOptions,
+} from "./prompt-bounds.ts";
 import { redactPromptSensitiveText } from "./redaction.ts";
 import type {
 	ContinuationSnapshot,
@@ -6,12 +13,21 @@ import type {
 	StateEvidenceBundle,
 } from "./types.ts";
 
+type JudgePromptContinuation =
+	| ContinuationSnapshot
+	| {
+			triggerEntryId?: string | null;
+			turns: Array<{
+				turnIndex?: number;
+				assistantText: string;
+				toolResults: unknown[];
+			}>;
+	  };
+
 export type JudgePromptInput = {
 	candidateSummary: string;
 	snapshot: Snapshot;
-	continuation:
-		| ContinuationSnapshot
-		| { turns: Array<{ assistantText: string; toolResults: unknown[] }> };
+	continuation: JudgePromptContinuation;
 	artifactRefs?: string[];
 	stateEvidence?: StateEvidenceBundle;
 };
@@ -82,13 +98,44 @@ Session critical literals:
 ${list(evidence.session.criticalLiterals)}`;
 }
 
-function continuationText(input: JudgePromptInput): string {
-	return input.continuation.turns
-		.map(
-			(turn, index) =>
-				`Turn ${index + 1}: ${turn.assistantText}\nTool results: ${JSON.stringify(turn.toolResults)}`,
-		)
-		.join("\n\n");
+function normalizeContinuation(
+	continuation: JudgePromptContinuation,
+): ContinuationSnapshot {
+	return {
+		triggerEntryId: continuation.triggerEntryId ?? null,
+		turns: continuation.turns.map((turn, index) => ({
+			turnIndex: turn.turnIndex ?? index + 1,
+			assistantText: turn.assistantText,
+			toolResults: turn.toolResults.map((result) => {
+				if (typeof result === "object" && result !== null) {
+					const raw = result as Record<string, unknown>;
+					return {
+						toolName:
+							typeof raw.toolName === "string" ? raw.toolName : "unknown",
+						toolCallId:
+							typeof raw.toolCallId === "string" ? raw.toolCallId : undefined,
+						isError: raw.isError === true,
+						text: typeof raw.text === "string" ? raw.text : JSON.stringify(raw),
+					};
+				}
+				return {
+					toolName: "unknown",
+					isError: false,
+					text: String(result),
+				};
+			}),
+		})),
+	};
+}
+
+function continuationText(
+	input: JudgePromptInput,
+	options: { maxChars: number; mode?: "standard" | "minimal" | "none" },
+): string {
+	return renderBoundedContinuationEvidence(
+		normalizeContinuation(input.continuation),
+		options,
+	);
 }
 
 function artifactRefsFor(input: JudgePromptInput): string[] {
@@ -98,10 +145,12 @@ function artifactRefsFor(input: JudgePromptInput): string[] {
 	];
 }
 
-export function buildJudgePrompt(input: JudgePromptInput): string {
+function renderJudgePrompt(
+	input: JudgePromptInput,
+	continuation: string,
+): string {
 	const manifest = input.snapshot.manifest;
 	const artifactRefs = artifactRefsFor(input);
-	const continuation = continuationText(input);
 
 	return redactPromptSensitiveText(`You are the Slipstream continuation-quality reviewer. Score whether this single candidate summary is strong enough to be the only durable handoff for a capable next coding agent.
 
@@ -191,6 +240,36 @@ ${continuation || "None"}
 </continuation>`);
 }
 
+export function buildJudgePrompt(
+	input: JudgePromptInput,
+	options?: PromptBudgetOptions,
+): string {
+	const budget = normalizePromptBudgetOptions(
+		options,
+		DEFAULT_MAX_JUDGE_PROMPT_CHARS,
+	);
+	const standardContinuation = continuationText(input, {
+		maxChars: budget.continuationMaxChars,
+		mode: "standard",
+	});
+	const minimalContinuation = continuationText(input, {
+		maxChars: Math.min(budget.continuationMaxChars, 8_000),
+		mode: "minimal",
+	});
+	const omittedContinuation = continuationText(input, {
+		maxChars: 1_000,
+		mode: "none",
+	});
+	return fitPromptWithDegradableSection({
+		render: (continuation) => renderJudgePrompt(input, continuation),
+		degradableStandard: standardContinuation,
+		degradableMinimal: minimalContinuation,
+		degradableOmitted: omittedContinuation,
+		maxPromptChars: budget.maxPromptChars,
+		fixedSectionName: "judge prompt",
+	});
+}
+
 function numericField(
 	raw: Record<string, unknown>,
 	key: string,
@@ -268,13 +347,15 @@ function isHardSafetyJudgeNote(note: string): boolean {
 }
 
 export function hasSecretShapedValue(text: string): boolean {
-	return /-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)-----/i.test(text) ||
+	return (
+		/-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)-----/i.test(text) ||
 		/\bBearer\s+(?!\[?REDACTED\]?|<redacted>|redacted\b)[A-Za-z0-9._~+/=-]{16,}/i.test(
 			text,
 		) ||
 		/\b[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PRIVATE[_-]?KEY|BEARER|CERTIFICATE|CERT)[A-Z0-9_]*\s*[:=]\s*(?:"(?!\[?REDACTED\]?|<redacted>|redacted\b)[^"\s]{8,}"|'(?!\[?REDACTED\]?|<redacted>|redacted\b)[^'\s]{8,}'|`(?!\[?REDACTED\]?|<redacted>|redacted\b)[^`\s]{8,}`|(?!\[?REDACTED\]?|<redacted>|redacted\b)[^\s'"`]{8,})/i.test(
 			text,
-		);
+		)
+	);
 }
 
 export function isAccepted(

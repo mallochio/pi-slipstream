@@ -17,6 +17,7 @@ import type {
 	CompleteTextFn,
 	ContextUsageSnapshot,
 	ContinuationSnapshot,
+	JudgeCompletion,
 	JudgeResult,
 	ProgressSink,
 	SessionEntry,
@@ -68,6 +69,22 @@ function yieldBeforeHeavyCompactionWork(): Promise<void> {
 
 function elapsedMs(startedAt: number): number {
 	return Math.max(0, Date.now() - startedAt);
+}
+
+function isJudgeCompletion(
+	value: JudgeResult | JudgeCompletion,
+): value is JudgeCompletion {
+	return "result" in value;
+}
+
+function normalizeJudgeCompletion(
+	completion: JudgeResult | JudgeCompletion,
+): JudgeCompletion {
+	return isJudgeCompletion(completion) ? completion : { result: completion };
+}
+
+function isJudgeParseError(judge: JudgeResult): boolean {
+	return judge.judgeStatus === "parse_error";
 }
 
 export async function runSlipstreamDryRun(
@@ -341,24 +358,68 @@ export async function runValidatedSlipstream(
 			tokensBefore: snapshot.tokensBefore,
 		};
 	}
-	input.onProgress?.({
-		phase: "judging",
-		message: "Judging candidate summary",
-	});
-	await yieldBeforeHeavyCompactionWork();
-	const judgePrompt = buildJudgePrompt({
-		candidateSummary: summary,
-		snapshot,
-		continuation: input.continuation,
-		artifactRefs: summaryArtifactRefs,
-		stateEvidence,
-	});
-	await store.writePromptMetrics(run, {
-		kind: "judge-prompt",
-		chars: judgePrompt.length,
-	});
+	const completeJudgeWithRetry = async (
+		promptInput: Parameters<typeof buildJudgePrompt>[0],
+		message: string,
+	): Promise<JudgeResult> => {
+		input.onProgress?.({
+			phase: "judging",
+			message,
+		});
+		await yieldBeforeHeavyCompactionWork();
+		const judgePrompt = buildJudgePrompt(promptInput);
+		await store.writePromptMetrics(run, {
+			kind: "judge-prompt",
+			chars: judgePrompt.length,
+		});
+		const completion = normalizeJudgeCompletion(
+			await input.completeJudge(judgePrompt, input.signal),
+		);
+		if (completion.rawText && isJudgeParseError(completion.result)) {
+			await store.writeJudgeRawResponse(run, {
+				attempt: "initial",
+				rawText: completion.rawText,
+			});
+		}
+		if (!isJudgeParseError(completion.result)) return completion.result;
+
+		input.onProgress?.({
+			phase: "judging",
+			message:
+				"Retrying judge after parse_error with minimized continuation evidence",
+			lastScore: completion.result.score,
+		});
+		await yieldBeforeHeavyCompactionWork();
+		const retryPrompt = buildJudgePrompt(promptInput, {
+			continuationMaxChars: 1_000,
+		});
+		await store.writePromptMetrics(run, {
+			kind: "judge-retry-prompt",
+			chars: retryPrompt.length,
+		});
+		const retry = normalizeJudgeCompletion(
+			await input.completeJudge(retryPrompt, input.signal),
+		);
+		if (retry.rawText && isJudgeParseError(retry.result)) {
+			await store.writeJudgeRawResponse(run, {
+				attempt: "retry",
+				rawText: retry.rawText,
+			});
+		}
+		return retry.result;
+	};
+
 	const judgingStartedAt = Date.now();
-	let judge = await input.completeJudge(judgePrompt, input.signal);
+	let judge = await completeJudgeWithRetry(
+		{
+			candidateSummary: summary,
+			snapshot,
+			continuation: input.continuation,
+			artifactRefs: summaryArtifactRefs,
+			stateEvidence,
+		},
+		"Judging candidate summary",
+	);
 	timingsMs.judging = elapsedMs(judgingStartedAt);
 	let repaired = false;
 	const threshold = input.judgeThreshold ?? 7;
@@ -371,7 +432,9 @@ export async function runValidatedSlipstream(
 
 	for (
 		let attempt = 0;
-		attempt < repairAttempts && !isAccepted(judge, threshold, summary);
+		attempt < repairAttempts &&
+		!isJudgeParseError(judge) &&
+		!isAccepted(judge, threshold, summary);
 		attempt += 1
 	) {
 		input.onProgress?.({
@@ -405,20 +468,15 @@ export async function runValidatedSlipstream(
 			summaryArtifactRefs,
 		);
 		await store.writeCandidate(run, summary);
-		input.onProgress?.({
-			phase: "judging",
-			message: "Judging repaired summary",
-		});
-		await yieldBeforeHeavyCompactionWork();
-		judge = await input.completeJudge(
-			buildJudgePrompt({
+		judge = await completeJudgeWithRetry(
+			{
 				candidateSummary: summary,
 				snapshot,
 				continuation: input.continuation,
 				artifactRefs: summaryArtifactRefs,
 				stateEvidence,
-			}),
-			input.signal,
+			},
+			"Judging repaired summary",
 		);
 		if (
 			isAccepted(judge, threshold, summary) &&
