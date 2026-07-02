@@ -156,6 +156,27 @@ export type LatestSignal = {
 	text: string;
 	entryId?: string;
 };
+export type UserAssertionKind =
+	| "current_directive"
+	| "approval_scope"
+	| "correction_supersession"
+	| "historical_background"
+	| "likely_stale_noisy";
+export type UserAssertionAuthority =
+	| "intent_scope"
+	| "user_reported_state_requires_verification"
+	| "historical_context";
+export type UserAssertionStaleRisk = "low" | "medium" | "high";
+export type UserAssertionTrailEntry = {
+	entryId: string;
+	kind: UserAssertionKind;
+	authority: UserAssertionAuthority;
+	userAsserted: string;
+	evidenceExcerpt: string;
+	staleRisk: UserAssertionStaleRisk;
+	staleReason?: string;
+	supersededByEntryId?: string;
+};
 
 export type SnapshotManifest = {
 	filesRead: string[];
@@ -172,6 +193,7 @@ export type SnapshotManifest = {
 	terminalFinalAnswerEvidence: string[];
 	latestSignals: LatestSignal[];
 	staleSignals: StaleSignal[];
+	userAssertionTrail: UserAssertionTrailEntry[];
 	criticalLiterals: string[];
 	previousSummary: string | null;
 	artifactRefs: string[];
@@ -224,6 +246,7 @@ export type StateEvidenceBundle = {
 		terminalFinalAnswerEvidence: string[];
 		latestSignals: string[];
 		staleSignals: string[];
+		userAssertionTrail?: string[];
 		criticalLiterals: string[];
 	};
 };

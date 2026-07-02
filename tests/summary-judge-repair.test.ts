@@ -75,6 +75,28 @@ const snapshot: Snapshot = {
 				reason: "Later evidence says npm test passed",
 			},
 		],
+		userAssertionTrail: [
+			{
+				entryId: "u-assert-1",
+				kind: "correction_supersession",
+				authority: "intent_scope",
+				userAsserted:
+					"User corrected that validation must pair with summary prompt improvement, not stricter prompting alone.",
+				evidenceExcerpt:
+					"Actually this is not just stricter prompting; validation has to be paired with the summary-prompt change.",
+				staleRisk: "low",
+			},
+			{
+				entryId: "u-assert-2",
+				kind: "historical_background",
+				authority: "user_reported_state_requires_verification",
+				userAsserted: "User reported that npm test passed earlier.",
+				evidenceExcerpt: "npm test passed earlier.",
+				staleRisk: "medium",
+				staleReason:
+					"User-reported runtime or verification state requires fresh verification before acting.",
+			},
+		],
 		criticalLiterals: ["TASK-1:high:alpha|shared|gamma", "E_RETRYABLE"],
 		previousSummary: "older",
 		artifactRefs: ["artifact://raw"],
@@ -259,6 +281,17 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /Redact secret-shaped values/);
 		assert.match(prompt, /auth\/cert\/key\/deletion\/deploy/);
 		assert.match(prompt, /stale or superseded candidates/i);
+		assert.match(
+			prompt,
+			/Historical user assertions from compacted-away messages/,
+		);
+		assert.match(prompt, /User assertion trail semantics/);
+		assert.match(prompt, /user intent, scope, preferences, and corrections/);
+		assert.match(prompt, /require fresh verification before acting/);
+		assert.match(
+			prompt,
+			/validation must pair with summary prompt improvement/,
+		);
 	});
 
 	it("includes state evidence as protected inputs", () => {
@@ -301,6 +334,9 @@ describe("summary, judge, and repair", () => {
 					staleSignals: [
 						"npm test failed — Later evidence says npm test passed",
 					],
+					userAssertionTrail: [
+						"[u-assert-1] correction_supersession/intent_scope/stale=low — User asserted: User corrected that validation must pair with summary prompt improvement, not stricter prompting alone. Evidence excerpt: Actually this is not just stricter prompting; validation has to be paired with the summary-prompt change.",
+					],
 					criticalLiterals: ["STATE_EVIDENCE_SENTINEL"],
 				},
 			},
@@ -313,6 +349,11 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /Full git diff recovery: partial/);
 		assert.match(prompt, /rerun git diff/);
 		assert.doesNotMatch(prompt, /Chunk evidence/);
+		assert.match(prompt, /Session user assertion trail/);
+		assert.match(
+			prompt,
+			/validation must pair with summary prompt improvement/,
+		);
 	});
 
 	it("redacts secret-retrieval commands and env values from model prompts", () => {
@@ -358,6 +399,7 @@ describe("summary, judge, and repair", () => {
 						terminalFinalAnswerEvidence: [],
 						latestSignals: [],
 						staleSignals: [],
+						userAssertionTrail: [],
 						criticalLiterals: [],
 					},
 				},
@@ -821,6 +863,12 @@ describe("summary, judge, and repair", () => {
 			/unsafe, materially incomplete, or not production-ready/,
 		);
 		assert.match(prompt, /score 8 summaries may be accepted/);
+		assert.match(
+			prompt,
+			/Compare the candidate summary against protected user assertions/,
+		);
+		assert.match(prompt, /omits high-value user intent/);
+		assert.match(prompt, /revives stale user assertions as current work/);
 		assert.match(prompt, /secret-shaped values/);
 		assert.match(prompt, /auth, cert, key, deletion, or deploy state/);
 		assert.match(prompt, /advisory, non-blocking improvements/);
@@ -932,6 +980,9 @@ describe("summary, judge, and repair", () => {
 						],
 						latestSignals: ["risk: repair needs current failing test"],
 						staleSignals: ["old failure — later evidence passed"],
+						userAssertionTrail: [
+							"[u-assert-1] correction_supersession/intent_scope/stale=low — User asserted: User corrected that validation must pair with summary prompt improvement.",
+						],
 						criticalLiterals: ["E_RETRYABLE"],
 					},
 				},
@@ -971,6 +1022,7 @@ describe("summary, judge, and repair", () => {
 		assert.match(prompt, /Next tool action:/);
 		assert.match(prompt, /Stale branch to ignore:/);
 		assert.match(prompt, /Protected repair context/i);
+		assert.match(prompt, /Protected user assertions/);
 		assert.match(prompt, /repair needs current failing test/);
 		assert.match(prompt, /risk: repair needs current failing test/);
 		assert.match(prompt, /repair must preserve current failing test risk/);

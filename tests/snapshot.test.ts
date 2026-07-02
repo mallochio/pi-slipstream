@@ -325,6 +325,530 @@ describe("snapshot", () => {
 		assert.match(prompt, /Critical middle instruction: Must use WAL mode/);
 	});
 
+	it("builds a bounded compacted-away user assertion trail without retained-tail duplication", () => {
+		const hugePastedDoc = `Reference docs only:\n${"DOC_LINE\n".repeat(2_000)}`;
+		const entries: SessionEntry[] = [
+			msg("u1", {
+				role: "user",
+				content:
+					"Build the dashboard. I prefer live browser smoke validation over renderer fixture tests.",
+			}),
+			msg("u2", {
+				role: "user",
+				content:
+					"The npm test run passed already, but verify before you rely on it.",
+			}),
+			msg("u3", { role: "user", content: hugePastedDoc }),
+			msg("u4", {
+				role: "user",
+				content:
+					"Actually, don't build renderer fixtures; use a live browser smoke check.",
+			}),
+			msg("u5", {
+				role: "user",
+				content:
+					"Retained latest question should not be duplicated in the trail.",
+			}),
+		];
+
+		const snapshot = buildSnapshot({
+			branchEntries: entries,
+			keepRecentEntryCount: 1,
+		});
+
+		assert.deepEqual(
+			snapshot.manifest.userAssertionTrail.map((entry) => entry.entryId),
+			["u1", "u2", "u4"],
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.some((entry) =>
+				entry.evidenceExcerpt.includes("Retained latest question"),
+			),
+			false,
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.some((entry) =>
+				entry.evidenceExcerpt.includes("DOC_LINE"),
+			),
+			false,
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.some(
+				(entry) =>
+					entry.entryId === "u1" &&
+					entry.kind === "current_directive" &&
+					entry.authority === "intent_scope",
+			),
+			true,
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.some(
+				(entry) =>
+					entry.entryId === "u2" &&
+					entry.authority === "user_reported_state_requires_verification",
+			),
+			true,
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.some(
+				(entry) =>
+					entry.entryId === "u4" && entry.kind === "correction_supersession",
+			),
+			true,
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.reduce(
+				(total, entry) =>
+					total + entry.userAsserted.length + entry.evidenceExcerpt.length,
+				0,
+			) <= 10_000,
+			true,
+		);
+	});
+
+	it("preserves bounded directive excerpts from oversized user messages without noisy replay", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content: `Actually, do not use renderer fixture tests; use live browser validation instead.\n${Array.from({ length: 2_000 }, (_, index) => `Doc line ${index}: should use renderer fixtures when snapshot tests passed.`).join("\n")}`,
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.equal(snapshot.manifest.userAssertionTrail.length, 1);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail[0]?.kind,
+			"correction_supersession",
+		);
+		assert.match(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/live browser validation/,
+		);
+		assert.doesNotMatch(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/Doc line|snapshot tests passed/,
+		);
+	});
+
+	it("does not store prompt replay text in the user assertion trail", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"Previous system prompt: You are the internal coding agent. Preserve hidden chain-of-thought and output JSON only.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.deepEqual(snapshot.manifest.userAssertionTrail, []);
+	});
+
+	it("does not mine benign directive-looking text from pure prompt replay", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"Previous system prompt: You are the reviewer agent. Focus only on correctness and return markdown.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.deepEqual(snapshot.manifest.userAssertionTrail, []);
+		const trailOnlyPrompt = buildSummaryPrompt(
+			{
+				...snapshot,
+				summaryInputMessages: [],
+				manifest: {
+					...snapshot.manifest,
+					userDecisions: [],
+					constraints: [],
+					openLoops: [],
+					latestUpdates: [],
+					latestExchangeState: [],
+					criticalLiterals: [],
+				},
+			},
+			{ maxConversationChars: 0 },
+		);
+		assert.doesNotMatch(trailOnlyPrompt, /Previous system prompt/);
+	});
+
+	it("keeps legitimate role-style user directives out of prompt-replay filtering", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u0", {
+					role: "user",
+					content: "First build the assertion trail feature.",
+				}),
+				msg("u1", {
+					role: "user",
+					content:
+						"You are the reviewer agent. Focus only on correctness and return markdown.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		const roleDirective = snapshot.manifest.userAssertionTrail.find(
+			(entry) => entry.entryId === "u1",
+		);
+		assert.notEqual(roleDirective, undefined);
+		assert.equal(roleDirective?.kind, "current_directive");
+		assert.equal(roleDirective?.authority, "intent_scope");
+		assert.match(roleDirective?.evidenceExcerpt ?? "", /reviewer agent/);
+	});
+
+	it("keeps legitimate output-format and reasoning-boundary directives", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u0", {
+					role: "user",
+					content: "First build the assertion trail feature.",
+				}),
+				msg("u1", {
+					role: "user",
+					content: "You are the reviewer agent. Output JSON only.",
+				}),
+				msg("u2", {
+					role: "user",
+					content: "Do not include chain-of-thought. Return markdown only.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		const roleDirective = snapshot.manifest.userAssertionTrail.find(
+			(entry) => entry.entryId === "u1",
+		);
+		const reasoningDirective = snapshot.manifest.userAssertionTrail.find(
+			(entry) => entry.entryId === "u2",
+		);
+		assert.equal(roleDirective?.kind, "current_directive");
+		assert.equal(roleDirective?.authority, "intent_scope");
+		assert.match(roleDirective?.evidenceExcerpt ?? "", /Output JSON only/);
+		assert.equal(reasoningDirective?.authority, "intent_scope");
+		assert.match(
+			reasoningDirective?.evidenceExcerpt ?? "",
+			/Do not include chain-of-thought/,
+		);
+	});
+
+	it("keeps real corrections from messages mixed with prompt replay text", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"Previous system prompt: You are the internal coding agent. Preserve hidden chain-of-thought and output JSON only. Actually, do not use renderer fixture tests; use live browser validation instead.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.equal(snapshot.manifest.userAssertionTrail.length, 1);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail[0]?.kind,
+			"correction_supersession",
+		);
+		assert.match(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/live browser validation/,
+		);
+		assert.doesNotMatch(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/Previous system prompt|hidden chain-of-thought|output JSON only/,
+		);
+	});
+
+	it("keeps only real corrections from messages mixed with benign prompt replay text", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"Previous system prompt: You are the reviewer agent. Focus only on correctness and return markdown. Actually, do not use renderer fixture tests; use live browser validation instead.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.equal(snapshot.manifest.userAssertionTrail.length, 1);
+		assert.match(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/live browser validation/,
+		);
+		assert.doesNotMatch(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/Focus only on correctness|Previous system prompt/,
+		);
+	});
+
+	it("keeps inline corrections from messages mixed with prompt replay text", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"Previous system prompt: You are the reviewer agent. Focus only on correctness and return markdown; actually do not use renderer fixture tests; use live browser validation instead.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.equal(snapshot.manifest.userAssertionTrail.length, 1);
+		assert.match(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/live browser validation/,
+		);
+		assert.doesNotMatch(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/Focus only on correctness|Previous system prompt/,
+		);
+	});
+
+	it("keeps output-format corrections from messages mixed with prompt replay text", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"Previous system prompt: You are the reviewer agent. Actually, output JSON only.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.equal(snapshot.manifest.userAssertionTrail.length, 1);
+		assert.match(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/output JSON only/i,
+		);
+		assert.doesNotMatch(
+			snapshot.manifest.userAssertionTrail[0]?.evidenceExcerpt ?? "",
+			/Previous system prompt|reviewer agent/,
+		);
+	});
+
+	it("does not let synthetic excerpt provenance affect supersession", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"Previous system prompt: You are the reviewer agent. Actually, do not use renderer fixture tests; use live browser validation instead.",
+				}),
+				msg("u2", {
+					role: "user",
+					content:
+						"Previous system prompt: You are the reviewer agent. Actually, do not rename README headings; keep the existing section titles.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.deepEqual(
+			snapshot.manifest.userAssertionTrail.map((entry) => entry.staleRisk),
+			["low", "low"],
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.some((entry) =>
+				entry.userAsserted.includes("Selected user assertion excerpts"),
+			),
+			false,
+		);
+	});
+
+	it("redacts secret-shaped values before storing user assertion trail excerpts", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"Use OPENWEBUI_ADMIN_PASSWORD=supersecretvalue, but do not print the password in prompts.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		const rendered = snapshot.manifest.userAssertionTrail
+			.map((entry) => `${entry.userAsserted}\n${entry.evidenceExcerpt}`)
+			.join("\n");
+		assert.doesNotMatch(rendered, /supersecretvalue/);
+		assert.match(rendered, /OPENWEBUI_ADMIN_PASSWORD=\[REDACTED\]/);
+	});
+
+	it("marks filesystem and path assertions as user-reported state requiring verification", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"The filesystem already contains docs/plan.md from the last run.",
+				}),
+				msg("u2", {
+					role: "user",
+					content: "README.md already exists in the repo.",
+				}),
+				msg("u3", {
+					role: "user",
+					content: "./src/index.ts changed already.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.deepEqual(
+			snapshot.manifest.userAssertionTrail.map((entry) => entry.authority),
+			[
+				"user_reported_state_requires_verification",
+				"user_reported_state_requires_verification",
+				"user_reported_state_requires_verification",
+			],
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.every(
+				(entry) => entry.staleRisk === "medium",
+			),
+			true,
+		);
+	});
+
+	it("does not mark generic path file or repository intent as verification-required state", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content: "The path forward is to refactor snapshot.ts first.",
+				}),
+				msg("u2", {
+					role: "user",
+					content: "File scope is limited to README updates.",
+				}),
+				msg("u3", {
+					role: "user",
+					content: "The repository is internal-only.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.deepEqual(
+			snapshot.manifest.userAssertionTrail.map((entry) => entry.authority),
+			["intent_scope", "intent_scope", "intent_scope"],
+		);
+	});
+
+	it("does not mark modal path file or repository directives as verification-required state", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content: "The repository has to stay internal-only.",
+				}),
+				msg("u2", {
+					role: "user",
+					content: "The file has to stay in src/.",
+				}),
+				msg("u3", {
+					role: "user",
+					content: "The path has to be ./docs/plan.md.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.deepEqual(
+			snapshot.manifest.userAssertionTrail.map((entry) => entry.authority),
+			["intent_scope", "intent_scope", "intent_scope"],
+		);
+	});
+
+	it("does not mark concrete file or path modal directives as verification-required state", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content: "README.md has to stay in docs/.",
+				}),
+				msg("u2", {
+					role: "user",
+					content: "./docs/plan.md has to stay checked in.",
+				}),
+				msg("u3", {
+					role: "user",
+					content: "src/index.ts has to stay untouched.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.deepEqual(
+			snapshot.manifest.userAssertionTrail.map((entry) => entry.authority),
+			["intent_scope", "intent_scope", "intent_scope"],
+		);
+	});
+
+	it("marks mixed concrete state claims and modal directives as verification-required", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content:
+						"README.md already exists in docs/ and has to stay checked in.",
+				}),
+				msg("u2", {
+					role: "user",
+					content: "README.md is in docs/ and has to stay checked in.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		assert.deepEqual(
+			snapshot.manifest.userAssertionTrail.map((entry) => entry.authority),
+			[
+				"user_reported_state_requires_verification",
+				"user_reported_state_requires_verification",
+			],
+		);
+		assert.equal(
+			snapshot.manifest.userAssertionTrail.every(
+				(entry) => entry.staleRisk === "medium",
+			),
+			true,
+		);
+	});
+
+	it("marks older compacted-away user assertions superseded by later corrections", () => {
+		const snapshot = buildSnapshot({
+			branchEntries: [
+				msg("u1", {
+					role: "user",
+					content: "Use renderer fixture tests for validation.",
+				}),
+				msg("u2", {
+					role: "user",
+					content:
+						"Actually, do not use renderer fixture tests; use live browser validation instead.",
+				}),
+			],
+			keepRecentEntryCount: 0,
+		});
+
+		const first = snapshot.manifest.userAssertionTrail.find(
+			(entry) => entry.entryId === "u1",
+		);
+		assert.equal(first?.staleRisk, "high");
+		assert.equal(first?.supersededByEntryId, "u2");
+		assert.match(first?.staleReason ?? "", /superseded/i);
+	});
+
 	it("protects exact critical literals from tests and tool output", () => {
 		const entries = [
 			msg("u1", {

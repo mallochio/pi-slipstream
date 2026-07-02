@@ -48,6 +48,16 @@ const snapshot: Snapshot = {
 			},
 		],
 		staleSignals: [],
+		userAssertionTrail: [
+			{
+				entryId: "u-assert-1",
+				kind: "approval_scope",
+				authority: "intent_scope",
+				userAsserted: "User approved internal-only state evidence changes.",
+				evidenceExcerpt: "ok, do the internal-only state evidence change",
+				staleRisk: "low",
+			},
+		],
 		criticalLiterals: ["STATE_EVIDENCE_SENTINEL"],
 		previousSummary: "older",
 		artifactRefs: [],
@@ -90,6 +100,9 @@ describe("state evidence", () => {
 		]);
 		assert.deepEqual(evidence.session.latestSignals, [
 			"verification_failure: npm test failed",
+		]);
+		assert.deepEqual(evidence.session.userAssertionTrail, [
+			"[u-assert-1] approval_scope/intent_scope/stale=low — User asserted: User approved internal-only state evidence changes. Evidence excerpt: ok, do the internal-only state evidence change",
 		]);
 		assert.deepEqual(evidence.session.criticalLiterals, [
 			"STATE_EVIDENCE_SENTINEL",

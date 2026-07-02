@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import type { Snapshot, StateEvidenceBundle } from "./types.ts";
+import type {
+	Snapshot,
+	StateEvidenceBundle,
+	UserAssertionTrailEntry,
+} from "./types.ts";
 
 export type GitExecutionResult = { stdout: string; stderr: string };
 export type ExecuteGitFn = (
@@ -74,6 +78,14 @@ function boundText(
 	};
 }
 
+function renderUserAssertionTrailEntry(entry: UserAssertionTrailEntry): string {
+	const stale = entry.staleReason ? ` (${entry.staleReason})` : "";
+	const superseded = entry.supersededByEntryId
+		? ` Superseded by: ${entry.supersededByEntryId}.`
+		: "";
+	return `[${entry.entryId}] ${entry.kind}/${entry.authority}/stale=${entry.staleRisk} — User asserted: ${entry.userAsserted} Evidence excerpt: ${entry.evidenceExcerpt}${stale}${superseded}`;
+}
+
 function sessionEvidence(snapshot: Snapshot): StateEvidenceBundle["session"] {
 	const manifest = snapshot.manifest;
 	return {
@@ -96,6 +108,9 @@ function sessionEvidence(snapshot: Snapshot): StateEvidenceBundle["session"] {
 		),
 		staleSignals: manifest.staleSignals.map(
 			(signal) => `${signal.text} — ${signal.reason}`,
+		),
+		userAssertionTrail: manifest.userAssertionTrail.map(
+			renderUserAssertionTrailEntry,
 		),
 		criticalLiterals: manifest.criticalLiterals,
 	};

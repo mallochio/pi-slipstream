@@ -11,7 +11,11 @@ import type {
 	SnapshotManifest,
 	ToolCallBlock,
 	ToolResultMessage,
+	UserAssertionAuthority,
+	UserAssertionKind,
+	UserAssertionTrailEntry,
 } from "./types.ts";
+import { redactPromptSensitiveText } from "./redaction.ts";
 import {
 	createCooperativeScheduler,
 	type CooperativeScheduler,
@@ -125,6 +129,9 @@ function intentExcerpts(text: string, pattern: RegExp): string[] {
 
 const MINED_USER_INTENT_OMISSION_MARKER =
 	"\n\n[... Slipstream omitted source text from oversized mined user intent. ...]";
+const USER_ASSERTION_TRAIL_MAX_CHARS = 10_000;
+const USER_ASSERTION_SIGNAL_RE =
+	/\b(?:actually|correction|wrong|instead|rather|supersede|ignore previous|ignore that|not that|don'?t|do not|stop|wait|hold on|approve|approved|approval|ok|yes|do it|go ahead|scope|only|permission|allowed|not allowed|don'?t touch|do not touch|please|can you|could you|implement|fix|add|change|review|analy[sz]e|use|prefer|must|should|need|want|has to|have to|test|passed|failed|verify|validation|live|browser|fixture)\b/i;
 
 function boundWithOmissionMarker(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
@@ -452,6 +459,324 @@ function mineTextFacts(
 				addRecentVerification(manifest, verificationIndex, text, messageIndex);
 		}
 	}
+}
+
+function isLikelyPastedBlob(text: string): boolean {
+	if (text.length > 6_000) return true;
+	const lineCount = text.split(/\r?\n/).length;
+	if (lineCount > 80) return true;
+	return /```|diff --git|BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)|<html|\{\s*"|^\s*(?:INFO|DEBUG|ERROR|WARN)\b/im.test(
+		text,
+	);
+}
+
+function isLikelyPromptReplay(text: string): boolean {
+	return /\b(?:previous|prior|original|old)?\s*(?:system|developer|assistant)\s+prompt\b|\bhidden (?:instruction|instructions|prompt)\b/i.test(
+		text,
+	);
+}
+
+function userAssertionCandidateUnits(text: string): string[] {
+	const units: string[] = [];
+	for (const line of text.split(/\r?\n+/)) {
+		const normalizedLine = normalizeUserAssertion(line);
+		if (!normalizedLine) continue;
+		const sentenceUnits = normalizedLine.split(/(?<=[.!?])\s+/);
+		for (const sentence of sentenceUnits) {
+			const normalizedSentence = normalizeUserAssertion(sentence);
+			if (!normalizedSentence) continue;
+			if (normalizedSentence.length <= 1_000) {
+				units.push(normalizedSentence);
+				continue;
+			}
+			for (const excerpt of intentExcerpts(
+				normalizedSentence,
+				USER_ASSERTION_SIGNAL_RE,
+			))
+				units.push(normalizeUserAssertion(excerpt));
+		}
+	}
+	return units;
+}
+
+function isPromptReplayCorrectionBoundary(text: string): boolean {
+	return /^\s*(?:actually|correction|wrong|instead|rather|ignore previous|ignore that|not that|don'?t|do not|stop|wait|hold on)\b/i.test(
+		text,
+	);
+}
+
+function isLikelyPastedReferenceUnit(text: string): boolean {
+	return /^\s*(?:doc(?:ument)?|reference|example|section|chapter|line)\b.{0,80}\b(?:should|must|passed|failed|use|prefer)\b/i.test(
+		text,
+	);
+}
+
+function correctionClauseFromPromptReplayUnit(unit: string): string | null {
+	if (isPromptReplayCorrectionBoundary(unit)) return unit;
+	const match =
+		/[;,]\s*(?:actually|correction|wrong|instead|rather|ignore previous|ignore that|not that|don'?t|do not|stop|wait|hold on)\b/i.exec(
+			unit,
+		);
+	if (!match) return null;
+	return normalizeUserAssertion(
+		unit.slice(match.index).replace(/^[;,]\s*/, ""),
+	);
+}
+
+function selectedUserAssertionExcerpts(
+	text: string,
+	options: { promptReplay: boolean; oversized: boolean },
+): string[] {
+	const excerpts = userAssertionCandidateUnits(text)
+		.map((unit) =>
+			options.promptReplay ? correctionClauseFromPromptReplayUnit(unit) : unit,
+		)
+		.filter((unit): unit is string => unit !== null)
+		.filter((unit) => USER_ASSERTION_SIGNAL_RE.test(unit))
+		.filter((unit) => !isLikelyPromptReplay(unit))
+		.filter((unit) => !/\breference docs only\b/i.test(unit))
+		.filter((unit) => !isLikelyPastedReferenceUnit(unit));
+	return excerpts.slice(0, options.oversized ? 1 : 3);
+}
+
+function extractUserAssertionSignalText(rawText: string): string | null {
+	const redacted = redactPromptSensitiveText(rawText);
+	const normalized = normalizeUserAssertion(redacted);
+	if (!normalized) return null;
+	const promptReplay = isLikelyPromptReplay(normalized);
+	const oversized = isLikelyPastedBlob(redacted);
+	if (!promptReplay && !oversized) return normalized;
+	const excerpts = selectedUserAssertionExcerpts(redacted, {
+		promptReplay,
+		oversized,
+	});
+	if (excerpts.length === 0) return null;
+	return excerpts.join(" ");
+}
+
+function isUserReportedStateClaim(text: string): boolean {
+	const normalized = text.replace(/\s+/g, " ");
+	const subjectRe =
+		/\b(?:test|typecheck|lint|build|git|filesystem|file|directory|folder|path|repo|repository|server|runtime|command|output|error|diff)\b|\b[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b|(?:\.\.?\/|\/|[A-Za-z0-9_.-]+\/)\S{2,180}/i;
+	const observedStateRe =
+		/\b(?:already|currently|now|from the last run|from last run)\b.{0,120}\b(?:passed|failed|succeeded|errored|exists|exist|changed|created|deleted|removed|renamed|contains|shows|says|clean|dirty|missing|running|started|stopped)\b|\b(?:passed|failed|succeeded|errored|exists|exist|changed|created|deleted|removed|renamed|contains|shows|says|clean|dirty|missing|running|started|stopped)\b.{0,80}\b(?:already|currently|now|from the last run|from last run)\b/i;
+	const concreteLocationStateRe =
+		/\b(?:is|are|was|were)\s+(?:in|under|inside|checked in|present|located|at)\b/i;
+	if (subjectRe.test(normalized) && observedStateRe.test(normalized))
+		return true;
+	if (subjectRe.test(normalized) && concreteLocationStateRe.test(normalized))
+		return true;
+	if (
+		/\b(?:filesystem|file|directory|folder|path|repo|repository)\b.{0,80}\b(?:has to|have to|needs? to|must|should|is to|are to)\b|(?:\b[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b|(?:\.\.?\/|\/|[A-Za-z0-9_.-]+\/)\S{2,180}).{0,80}\b(?:has to|have to|needs? to|must|should|is to|are to)\b/i.test(
+			normalized,
+		)
+	)
+		return false;
+	return /\b(?:test|typecheck|lint|build|git|filesystem|file|directory|folder|path|repo|repository|server|runtime|command|output|error|diff)\b.{0,140}\b(?:passed|failed|succeeded|errored|exists|exist|changed|created|deleted|removed|renamed|contains|has|shows|says|clean|dirty|missing|running|started|stopped)\b|\b(?:\.\.?\/|\/|[A-Za-z0-9_.-]+\/)\S{2,180}.{0,140}\b(?:exists|exist|changed|created|deleted|removed|renamed|contains|has|clean|dirty|missing)\b|\b[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}\b.{0,140}\b(?:exists|exist|changed|created|deleted|removed|renamed|contains|has|clean|dirty|missing)\b|\b(?:passed|failed|succeeded|errored|clean|dirty|missing|running|started|stopped)\b.{0,140}\b(?:test|typecheck|lint|build|command|run|git|filesystem|file|directory|folder|path|repo|repository|server|runtime)\b/i.test(
+		normalized,
+	);
+}
+
+function userAssertionKind(
+	text: string,
+	isInitialUserMessage: boolean,
+): UserAssertionKind {
+	if (isLikelyPastedBlob(text)) return "likely_stale_noisy";
+	if (
+		/\b(?:actually|correction|wrong|instead|rather|supersede|ignore previous|ignore that|not that|don'?t|do not|stop|wait|hold on)\b/i.test(
+			text,
+		)
+	)
+		return "correction_supersession";
+	if (
+		/\b(?:approve|approved|approval|ok|yes|do it|go ahead|scope|permission|allowed|not allowed|don'?t touch|do not touch)\b|\bonly\b.{0,40}\b(?:scope|file|files|path|paths|repo|repository|touch|change|allowed|permission)\b|\b(?:scope|file|files|path|paths|repo|repository)\b.{0,40}\bonly\b/i.test(
+			text,
+		)
+	)
+		return "approval_scope";
+	if (
+		isInitialUserMessage ||
+		/\b(?:please|can you|could you|do|implement|fix|add|change|review|analy[sz]e|use|prefer|must|should|need|want|has to|have to|let'?s|make)\b|\byou are (?:the|an?|a) .{0,80}\bagent\b|\bfocus\b.{0,120}\breturn\b/i.test(
+			text,
+		)
+	)
+		return "current_directive";
+	return "historical_background";
+}
+
+function userAssertionAuthority(
+	text: string,
+	kind: UserAssertionKind,
+): UserAssertionAuthority {
+	if (kind === "likely_stale_noisy") return "historical_context";
+	if (isUserReportedStateClaim(text))
+		return "user_reported_state_requires_verification";
+	if (kind === "historical_background") return "historical_context";
+	return "intent_scope";
+}
+
+function normalizeUserAssertion(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+function boundUserAssertionText(text: string, maxChars: number): string {
+	const redacted = redactPromptSensitiveText(text);
+	const normalized = normalizeUserAssertion(redacted);
+	if (normalized.length <= maxChars) return normalized;
+	const excerpts = intentExcerpts(normalized, USER_ASSERTION_SIGNAL_RE);
+	const selected = excerpts.length > 0 ? excerpts.join(" ") : normalized;
+	return boundWithOmissionMarker(selected, maxChars);
+}
+
+function buildUserAssertionEntry(
+	entry: MessageEntry,
+	isInitialUserMessage: boolean,
+): UserAssertionTrailEntry | null {
+	if (entry.message.role !== "user") return null;
+	const rawText = extractText(entry.message.content).trim();
+	if (!rawText) return null;
+	const assertionText = extractUserAssertionSignalText(rawText);
+	if (assertionText === null) return null;
+	const kind = userAssertionKind(assertionText, isInitialUserMessage);
+	if (kind === "likely_stale_noisy") return null;
+	const authority = userAssertionAuthority(assertionText, kind);
+	const staleRisk =
+		authority === "user_reported_state_requires_verification"
+			? "medium"
+			: "low";
+	return {
+		entryId: entry.id,
+		kind,
+		authority,
+		userAsserted: boundUserAssertionText(assertionText, 320),
+		evidenceExcerpt: boundUserAssertionText(assertionText, 700),
+		staleRisk,
+		...(authority === "user_reported_state_requires_verification"
+			? {
+					staleReason:
+						"User-reported runtime, filesystem, git, or verification state requires fresh verification before acting.",
+				}
+			: {}),
+	};
+}
+
+function entryRenderLength(entry: UserAssertionTrailEntry): number {
+	return [
+		entry.entryId,
+		entry.kind,
+		entry.authority,
+		entry.userAsserted,
+		entry.evidenceExcerpt,
+		entry.staleRisk,
+		entry.staleReason ?? "",
+		entry.supersededByEntryId ?? "",
+	].join(" ").length;
+}
+
+function assertionPriority(
+	entry: UserAssertionTrailEntry,
+	index: number,
+	lastIndex: number,
+): number {
+	if (entry.kind === "correction_supersession") return 0;
+	if (entry.kind === "approval_scope") return 1;
+	if (index === 0) return 2;
+	if (entry.kind === "current_directive") return 3;
+	if (entry.authority === "user_reported_state_requires_verification") return 4;
+	if (entry.kind === "historical_background") return 5;
+	return lastIndex - index + 6;
+}
+
+function significantAssertionTokens(text: string): Set<string> {
+	const stopWords = new Set([
+		"actually",
+		"before",
+		"instead",
+		"should",
+		"would",
+		"could",
+		"please",
+		"validation",
+	]);
+	return new Set(
+		text
+			.toLowerCase()
+			.match(/[a-z][a-z0-9_-]{3,}/g)
+			?.filter((token) => !stopWords.has(token)) ?? [],
+	);
+}
+
+function sharesUserAssertionTopic(left: string, right: string): boolean {
+	if (sharesOverlapKey(left, right)) return true;
+	const leftTokens = significantAssertionTokens(left);
+	const rightTokens = significantAssertionTokens(right);
+	let shared = 0;
+	for (const token of leftTokens) {
+		if (!rightTokens.has(token)) continue;
+		shared += 1;
+		if (shared >= 2) return true;
+	}
+	return false;
+}
+
+function markSupersededUserAssertions(
+	entries: UserAssertionTrailEntry[],
+): void {
+	for (let index = 0; index < entries.length; index += 1) {
+		const entry = entries[index];
+		if (!entry) continue;
+		for (
+			let laterIndex = index + 1;
+			laterIndex < entries.length;
+			laterIndex += 1
+		) {
+			const later = entries[laterIndex];
+			if (!later || later.kind !== "correction_supersession") continue;
+			if (!sharesUserAssertionTopic(entry.userAsserted, later.userAsserted))
+				continue;
+			entry.staleRisk = "high";
+			entry.staleReason = `Superseded by later user correction ${later.entryId}.`;
+			entry.supersededByEntryId = later.entryId;
+			break;
+		}
+	}
+}
+
+function mineUserAssertionTrail(
+	compactedEntries: MessageEntry[],
+	manifest: SnapshotManifest,
+): void {
+	const firstUserIndex = compactedEntries.findIndex(
+		(entry) => entry.message.role === "user",
+	);
+	const candidates = compactedEntries
+		.map((entry, index) => ({
+			entry: buildUserAssertionEntry(entry, index === firstUserIndex),
+			index,
+		}))
+		.filter(
+			(item): item is { entry: UserAssertionTrailEntry; index: number } =>
+				item.entry !== null,
+		);
+	markSupersededUserAssertions(candidates.map((candidate) => candidate.entry));
+	const lastIndex = compactedEntries.length - 1;
+	const selected: Array<{ entry: UserAssertionTrailEntry; index: number }> = [];
+	let usedChars = 0;
+	for (const candidate of [...candidates].sort((left, right) => {
+		const priorityDelta =
+			assertionPriority(left.entry, left.index, lastIndex) -
+			assertionPriority(right.entry, right.index, lastIndex);
+		if (priorityDelta !== 0) return priorityDelta;
+		return right.index - left.index;
+	})) {
+		const cost = entryRenderLength(candidate.entry);
+		if (usedChars + cost > USER_ASSERTION_TRAIL_MAX_CHARS) continue;
+		selected.push(candidate);
+		usedChars += cost;
+	}
+	manifest.userAssertionTrail = selected
+		.sort((left, right) => left.index - right.index)
+		.map((candidate) => candidate.entry);
 }
 
 function mineBash(
@@ -1136,6 +1461,7 @@ function capManifest(manifest: SnapshotManifest): void {
 	);
 	manifest.latestSignals = capLatestSignals(manifest.latestSignals, 8);
 	manifest.staleSignals = capArray(manifest.staleSignals, 40);
+	manifest.userAssertionTrail = capArray(manifest.userAssertionTrail, 40);
 	manifest.criticalLiterals = capArray(manifest.criticalLiterals, 80);
 	if (manifest.previousSummary && manifest.previousSummary.length > 80_000) {
 		const headChars = 24_000;
@@ -1246,6 +1572,7 @@ export function buildSnapshot(input: BuildSnapshotInput): Snapshot {
 		terminalFinalAnswerEvidence: [],
 		latestSignals: [],
 		staleSignals: [],
+		userAssertionTrail: [],
 		criticalLiterals: [],
 		previousSummary: previousSummary(input.branchEntries),
 		artifactRefs: previousArtifactRefs(input.branchEntries),
@@ -1259,6 +1586,7 @@ export function buildSnapshot(input: BuildSnapshotInput): Snapshot {
 	mineCriticalLiterals(messageEntries, manifest);
 	mineLatestSignals(messageEntries, manifest);
 	mineLatestUpdates(compactedEntries, manifest);
+	mineUserAssertionTrail(compactedEntries, manifest);
 	mineRetainedTailUpdates(retainedEntries, manifest);
 	mineLatestExchangeState(messageEntries, manifest);
 	mineTerminalFinalAnswerEvidence(messageEntries, manifest);
@@ -1332,6 +1660,7 @@ export async function buildSnapshotAsync(
 		terminalFinalAnswerEvidence: [],
 		latestSignals: [],
 		staleSignals: [],
+		userAssertionTrail: [],
 		criticalLiterals: [],
 		previousSummary: previousSummary(input.branchEntries),
 		artifactRefs: previousArtifactRefs(input.branchEntries),
@@ -1350,6 +1679,7 @@ export async function buildSnapshotAsync(
 	mineLatestSignals(messageEntries, manifest);
 	await scheduler.checkpoint();
 	mineLatestUpdates(compactedEntries, manifest);
+	mineUserAssertionTrail(compactedEntries, manifest);
 	mineRetainedTailUpdates(retainedEntries, manifest);
 	await scheduler.checkpoint();
 	mineLatestExchangeState(messageEntries, manifest);

@@ -176,7 +176,7 @@ Pi session grows
       │
       ├─ freeze the old state
       │    files, errors, decisions, constraints, latest exchange,
-      │    changed paths, verification evidence, and critical literals
+      │    changed paths, verification evidence, user assertions, and critical literals
       │
       ├─ collect recovery evidence
       │    local artifacts, git status, and git diff evidence
@@ -205,12 +205,13 @@ The important difference from a normal summarizer: adoption is validated and sco
 - `/slipstream` support commands for status, artifact inspection, dry-run, and prepare/adopt evaluation.
 - Automatic trigger, enabled by default and configurable with `autoTrigger`.
 - Slipstream-style continuation validation before adoption.
-- Deterministic manifest extraction for files, errors, decisions, constraints, open loops, verification evidence, latest compacted updates, retained-tail current-state anchors, latest user/assistant exchange state, conservative stale/superseded signals, and critical literals.
+- Deterministic manifest extraction for files, errors, decisions, constraints, open loops, verification evidence, latest compacted updates, retained-tail current-state anchors, latest user/assistant exchange state, conservative stale/superseded signals, bounded compacted-away user assertion trails, and critical literals.
 - Local artifact store under `.scratch/compactions`, with cooperative chunked trigger snapshot writes so large raw recovery artifacts do not require one giant foreground JSON serialization.
 - Central per-session performance stats under `~/.config/pi/.scratch/slipstream-stats/sessions/<session-id>.jsonl`: mode, outcome, timing buckets, judge score, tokens before compaction, and redacted/relative artifact path by default.
 - Full compaction-time git diff preservation as chunked artifacts when below artifact byte caps, while keeping model-visible diff text bounded.
 - Explicit rejection path: rejected summaries are accepted by policy with score, judge diagnostics, artifacts, and `rejectedSummaryAccepted: true`; `ask` mode shows a scored confirmation dialog first when UI is available, and expert `--prepare` summaries are recoverable from `pending.json` if runtime state resets before `--adopt`.
 - Adoption-time freshness guard: pending summaries store `validatedThroughEntryId`; expert `--adopt` and auto activation revalidate against the current branch if newer messages appeared after preparation, while default `/compact` ignores stale pending state and generates a fresh summary instead of adopting it. Consumed pending artifacts are cleared so an old `pending.json` cannot be replayed after compaction.
+- Bounded compacted-away user assertion trail that preserves high-value user intent, approvals, scope boundaries, and corrections without replaying raw prompts; user-reported filesystem, git, runtime, or test claims are marked as requiring fresh verification.
 - Bounded `Session Findings` summary section for durable source-grounded facts that are useful later but are not the immediate next action.
 - TypeScript package manifest for Pi extension loading.
 

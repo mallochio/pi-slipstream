@@ -54,6 +54,16 @@ function list(lines: string[]): string {
 	return lines.length ? lines.map((line) => `- ${line}`).join("\n") : "- None";
 }
 
+function renderManifestUserAssertionTrail(snapshot: Snapshot): string[] {
+	return snapshot.manifest.userAssertionTrail.map((entry) => {
+		const stale = entry.staleReason ? ` (${entry.staleReason})` : "";
+		const superseded = entry.supersededByEntryId
+			? ` Superseded by: ${entry.supersededByEntryId}.`
+			: "";
+		return `[${entry.entryId}] ${entry.kind}/${entry.authority}/stale=${entry.staleRisk} — User asserted: ${entry.userAsserted} Evidence excerpt: ${entry.evidenceExcerpt}${stale}${superseded}`;
+	});
+}
+
 function distilledStateEvidence(
 	evidence: StateEvidenceBundle | undefined,
 ): string {
@@ -94,6 +104,8 @@ Session latest verification and risk signals:
 ${list(evidence.session.latestSignals)}
 Session stale/superseded candidates:
 ${list(evidence.session.staleSignals)}
+Session user assertion trail:
+${list(evidence.session.userAssertionTrail ?? [])}
 Session critical literals:
 ${list(evidence.session.criticalLiterals)}`;
 }
@@ -182,7 +194,7 @@ Evaluate these categories:
 - staleStateSuppression: labels or suppresses superseded branches instead of presenting them as current.
 - lowNoiseLowContradiction: avoids fabricated facts, noisy inventories, and distracting stale context.
 
-Reject critical stale or contradictory current state even when fact recall is high. Reject summaries that claim completion, clean state, or passing verification when the evidence only supports uncertainty or an in-progress handoff. Treat latest verification/risk signals and terminal final-answer evidence as high-priority current-state evidence unless retained continuation context clearly supersedes them. Artifact references are recovery pointers, not hidden evidence substitutes.
+Reject critical stale or contradictory current state even when fact recall is high. Reject summaries that claim completion, clean state, or passing verification when the evidence only supports uncertainty or an in-progress handoff. Treat latest verification/risk signals and terminal final-answer evidence as high-priority current-state evidence unless retained continuation context clearly supersedes them. Compare the candidate summary against protected user assertions: penalize summaries that omit high-value user intent, scope, preference, approval, or correction assertions that affect continuation; call out when the candidate omits high-value user intent; and penalize any candidate that revives stale user assertions as current work. User-reported filesystem/test/runtime claims require verification and must not be presented as verified facts unless newer evidence proves them. Artifact references are recovery pointers, not hidden evidence substitutes.
 
 Protected manifest files modified:
 ${list(manifest.filesModified)}
@@ -219,6 +231,9 @@ ${list(manifest.latestSignals.map((signal) => `${signal.kind}: ${signal.text}`))
 
 Protected stale or superseded candidates:
 ${list(manifest.staleSignals.map((signal) => `${signal.text} — ${signal.reason}`))}
+
+Protected user assertions from compacted-away messages:
+${list(renderManifestUserAssertionTrail(input.snapshot))}
 
 Protected critical literals / exact expected strings:
 ${list(manifest.criticalLiterals)}
