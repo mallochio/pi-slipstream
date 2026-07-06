@@ -3293,12 +3293,10 @@ describe("auto Slipstream lifecycle", () => {
 			() => autoJobIdleChecks === 1,
 			"first busy auto idle check",
 		);
-		assert.equal(finalizeCalls, 0);
+		await waitUntil(() => finalizeCalls === 1, "busy auto finalization");
+		assert.equal(compactCalls, 0);
+		assert.equal(state.status, "ready_to_adopt");
 		idle = true;
-		await waitUntil(
-			() => finalizeCalls === 1,
-			"busy-to-idle auto finalization",
-		);
 		await waitUntil(() => compactCalls === 1, "busy-to-idle auto adoption");
 	});
 
@@ -3437,12 +3435,13 @@ describe("auto Slipstream lifecycle", () => {
 			() => autoJobIdleChecks === 1,
 			"first pending-message auto readiness check",
 		);
-		assert.equal(finalizeCalls, 0);
-		hasPendingMessages = false;
 		await waitUntil(
 			() => finalizeCalls === 1,
-			"pending-message-cleared auto finalization",
+			"pending-message auto finalization",
 		);
+		assert.equal(compactCalls, 0);
+		assert.equal(state.status, "ready_to_adopt");
+		hasPendingMessages = false;
 		await waitUntil(
 			() => compactCalls === 1,
 			"pending-message-cleared auto adoption",
@@ -3859,8 +3858,9 @@ describe("auto Slipstream lifecycle", () => {
 					validatedThroughEntryId: "a2",
 					tokensBefore: 100,
 					details: { judge: { score: 9 }, artifacts: [] },
-					expiresAt: 10_000,
+					expiresAt: Date.now() + 10_000,
 				});
+				input.state.autoJob = null;
 				return true;
 			},
 		});
@@ -4387,6 +4387,109 @@ describe("auto Slipstream lifecycle", () => {
 		);
 		assert.equal(state.pending?.firstKeptEntryId, "new-boundary");
 		assert.equal(compactCalls, 1);
+	});
+
+	it("revalidates stale pending while busy but defers actual compaction until idle", async () => {
+		const state = createRuntimeState();
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nOld pending",
+			firstKeptEntryId: "old-boundary",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 100,
+			details: { judge: { score: 8 }, artifacts: [] },
+			expiresAt: 4_000_000_000_000,
+		});
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "old answer" }),
+			msg("u2", { role: "user", content: "new work" }),
+			msg("a2", { role: "assistant", content: "new answer" }),
+		];
+		let compactCalls = 0;
+		let revalidationCalls = 0;
+		let idle = false;
+		const revalidatedArtifactDir = await mkdtemp(
+			join(process.cwd(), ".scratch", "test-tmp", "revalidated-busy-"),
+		);
+		const handlers: Partial<
+			Record<"turn_end", (event: unknown, ctx: unknown) => Promise<void> | void>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(pi, config(), state, {
+			runValidatedSlipstream: async (): Promise<ValidatedRunResult> => {
+				revalidationCalls += 1;
+				return {
+					mode: "validated",
+					accepted: true,
+					repaired: false,
+					artifactDir: revalidatedArtifactDir,
+					summary: "## Goal\nRevalidated while busy",
+					judge: {
+						score: 9,
+						decision: "accept",
+						missing: [],
+						contradictions: [],
+						diagnosis: "ok",
+					},
+					firstKeptEntryId: "new-boundary",
+					tokensBefore: 200,
+				};
+			},
+		});
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 2,
+				message: {
+					role: "assistant",
+					content: "new answer",
+					stopReason: "stop",
+				},
+				toolResults: [],
+			},
+			{
+				cwd: "/repo",
+				model: { provider: "test", id: "model" },
+				modelRegistry: {
+					find: () => ({ provider: "test", id: "model" }),
+					getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+				},
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+				getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+				compact: () => {
+					compactCalls += 1;
+				},
+				isIdle: () => idle,
+				hasPendingMessages: () => false,
+			},
+		);
+		await waitUntil(() => revalidationCalls === 1, "busy stale revalidation");
+		await waitUntil(
+			() => state.pending?.firstKeptEntryId === "new-boundary",
+			"busy stale revalidation completion",
+		);
+		assert.equal(compactCalls, 0);
+		assert.equal(state.status, "ready_to_adopt");
+
+		idle = true;
+		await waitUntil(
+			() => compactCalls === 1,
+			"idle adoption after revalidation",
+		);
+		assert.equal(state.status, "summarizing");
 	});
 
 	it("queues a later turn_end while stale pending revalidation is running", async () => {
@@ -5375,8 +5478,72 @@ describe("auto Slipstream lifecycle", () => {
 
 		assert.equal(compactCalls, 0);
 		idle = true;
+		await waitUntil(() => compactCalls === 1, "idle prepared adoption");
+		assert.equal(state.status, "summarizing");
+	});
+
+	it("rechecks readiness immediately before prepared compaction", async () => {
+		const state = createRuntimeState();
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nReady",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 100,
+			details: { judge: { score: 8 }, artifacts: [] },
+			expiresAt: 4_000_000_000_000,
+		});
+		const branch = [
+			msg("u1", { role: "user", content: "old" }),
+			msg("a1", { role: "assistant", content: "ready" }),
+		];
+		let compactCalls = 0;
+		let idle = false;
+		let readinessChecks = 0;
+		const handlers: Partial<
+			Record<"turn_end", (event: unknown, ctx: unknown) => Promise<void> | void>
+		> = {};
+		const pi = {
+			on: (
+				event: string,
+				handler: (event: unknown, ctx: unknown) => Promise<void> | void,
+			) => {
+				if (event === "turn_end") handlers.turn_end = handler;
+			},
+		} as unknown as Parameters<typeof registerLifecycle>[0];
+		registerLifecycle(pi, config(), state);
+
+		await handlers.turn_end?.(
+			{
+				turnIndex: 1,
+				message: { role: "assistant", content: "ready", stopReason: "stop" },
+				toolResults: [],
+			},
+			{
+				cwd: "/repo",
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => branch,
+				},
+				getContextUsage: () => ({ tokens: 60_000, contextWindow: 100_000 }),
+				compact: () => {
+					compactCalls += 1;
+				},
+				isIdle: () => {
+					readinessChecks += 1;
+					return readinessChecks === 1 || idle;
+				},
+				hasPendingMessages: () => false,
+			},
+		);
 		await new Promise((resolve) => setTimeout(resolve, 0));
-		assert.equal(compactCalls, 1);
+		assert.equal(compactCalls, 0);
+		assert.equal(state.status, "ready_to_adopt");
+
+		idle = true;
+		await waitUntil(() => compactCalls === 1, "idle adoption after final gate");
 		assert.equal(state.status, "summarizing");
 	});
 
@@ -5647,9 +5814,7 @@ describe("auto Slipstream lifecycle", () => {
 
 		assert.equal(compactCalls, 0);
 		idle = true;
-		await new Promise((resolve) => setTimeout(resolve, 0));
-
-		assert.equal(compactCalls, 1);
+		await waitUntil(() => compactCalls === 1, "deduplicated idle adoption");
 		assert.equal(state.status, "summarizing");
 	});
 

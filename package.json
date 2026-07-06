@@ -1,57 +1,57 @@
 {
-	"name": "pi-slipstream-compact",
-	"version": "0.1.4",
-	"description": "Slipstream-style validated compaction extension for Pi Coding Agent",
-	"type": "module",
-	"author": "OrestesK",
-	"license": "MIT",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/OrestesK/pi-slipstream-compact.git"
-	},
-	"bugs": {
-		"url": "https://github.com/OrestesK/pi-slipstream-compact/issues"
-	},
-	"homepage": "https://github.com/OrestesK/pi-slipstream-compact#readme",
-	"exports": {
-		".": "./src/index.ts",
-		"./integration-api": "./src/integration-api.ts",
-		"./package.json": "./package.json"
-	},
-	"publishConfig": {
-		"access": "public"
-	},
-	"keywords": [
-		"pi-package",
-		"pi-extension",
-		"compaction",
-		"slipstream",
-		"context-compression"
-	],
-	"files": [
-		"src/",
-		"types/",
-		"docs/latest-full-benchmark-2026-05-29.md",
-		"LICENSE",
-		"README.md",
-		"package.json"
-	],
-	"scripts": {
-		"test": "node --experimental-strip-types --test tests/*.test.ts",
-		"typecheck": "tsc --noEmit",
-		"check": "npm test && npm run typecheck"
-	},
-	"pi": {
-		"extensions": [
-			"./src/index.ts"
-		]
-	},
-	"peerDependencies": {
-		"@mariozechner/pi-ai": "*",
-		"@mariozechner/pi-coding-agent": "*"
-	},
-	"devDependencies": {
-		"@types/node": "^24.10.1",
-		"typescript": "^5.9.3"
-	}
+  "name": "pi-slipstream-compact",
+  "version": "0.1.7",
+  "description": "Slipstream-style validated compaction extension for Pi Coding Agent",
+  "type": "module",
+  "author": "OrestesK",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OrestesK/pi-slipstream-compact.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OrestesK/pi-slipstream-compact/issues"
+  },
+  "homepage": "https://github.com/OrestesK/pi-slipstream-compact#readme",
+  "exports": {
+    ".": "./src/index.ts",
+    "./integration-api": "./src/integration-api.ts",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "compaction",
+    "slipstream",
+    "context-compression"
+  ],
+  "files": [
+    "src/",
+    "types/",
+    "docs/latest-full-benchmark-2026-05-29.md",
+    "LICENSE",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm test && npm run typecheck"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
 }

@@ -401,6 +401,37 @@ describe("pending adoption state", () => {
 		assert.equal(compactCalls, 1);
 	});
 
+	it("keeps explicit validated adoption pending while Pi is busy", () => {
+		const state = createRuntimeState({ now: 100 });
+		let compactCalls = 0;
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "p1",
+			summary: "validated",
+			firstKeptEntryId: "k1",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 500,
+			details: { judge: { score: 9 }, artifacts: [] },
+			expiresAt: 200,
+		});
+		const ctx = {
+			compact: () => {
+				compactCalls += 1;
+			},
+			isIdle: () => false,
+			hasPendingMessages: () => false,
+		};
+
+		assert.equal(
+			adoptPending(state, ctx, { now: 150, sessionId: "s1", cwd: "/repo" }),
+			"busy",
+		);
+		assert.equal(compactCalls, 0);
+		assert.equal(state.status, "ready_to_adopt");
+		assert.equal(state.pending?.summary, "validated");
+	});
+
 	it("explicit adoption resets status from compact callbacks", () => {
 		const completed = createRuntimeState({ now: 100 });
 		storePendingValidated(completed, {

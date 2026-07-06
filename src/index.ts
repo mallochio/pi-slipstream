@@ -5,7 +5,7 @@ import type {
 	SessionBeforeCompactEvent,
 	SessionTreeEvent,
 	TurnEndEvent,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import {
 	finalizeAutoJob,
 	isAutoTriggerBoundary,
@@ -380,13 +380,20 @@ function isIncompleteAssistantTurn(event: TurnEndEvent): boolean {
 	return message.stopReason === "error" || message.stopReason === "aborted";
 }
 
+type PreparedCompactionTriggerResult = "started" | "busy" | "unavailable";
+
 function triggerPreparedCompaction(
 	ctx: PiContext,
 	state: RuntimeState,
 	config: SlipstreamConfig,
-): void {
+): PreparedCompactionTriggerResult {
 	try {
-		if (!ctx.compact) return;
+		if (!ctx.compact) return "unavailable";
+		if (!shouldTriggerPreparedCompactionNow(runtimeReadiness(ctx))) {
+			state.status = state.pending ? "ready_to_adopt" : "idle";
+			restorePersistentStatus(ctx, state, config);
+			return "busy";
+		}
 		state.status = "summarizing";
 		const request = requestSlipstreamCompaction(state);
 		ctx.ui?.setStatus?.("slipstream", "slipstream: adopting");
@@ -405,10 +412,12 @@ function triggerPreparedCompaction(
 				restorePersistentStatus(ctx, state, config);
 			},
 		});
+		return "started";
 	} catch (error) {
 		clearSlipstreamCompactionRequest(state);
 		state.status = state.pending ? "ready_to_adopt" : "idle";
 		ignoreStaleContextError(error);
+		return "unavailable";
 	}
 }
 
@@ -639,13 +648,8 @@ export function registerLifecycle(
 					runtimeReadiness(ctx),
 				);
 				if (state.autoJob) {
-					if (!readyForIdleWork) {
-						scheduleDeferredIdleRetry(ctx, busyIdleRetryDelayMs);
-						return;
-					}
 					void finalizeAutoAtSafeBoundary(ctx, {
 						allowIncompleteContinuation: true,
-						requireIdleBeforeFinalize: true,
 					}).catch(ignoreStaleContextError);
 					return;
 				}
@@ -769,15 +773,19 @@ export function registerLifecycle(
 			ignoreStaleContextError(error);
 			return false;
 		}
-		if (!shouldTriggerPreparedCompactionNow(runtimeReadiness(ctx))) {
-			if (
-				options.allowDeferredRetry !== false &&
-				state.pending &&
-				state.status === "ready_to_adopt"
-			)
-				scheduleDeferredIdleRetry(ctx);
-			return false;
-		}
+		const triggerIfReady = (): boolean => {
+			if (!shouldTriggerPreparedCompactionNow(runtimeReadiness(ctx))) {
+				if (options.allowDeferredRetry !== false)
+					scheduleDeferredIdleRetry(ctx, busyIdleRetryDelayMs);
+				restorePersistentStatus(ctx, state, config);
+				return false;
+			}
+			clearDeferredIdleRetry();
+			const triggered = triggerPreparedCompaction(ctx, state, config);
+			if (triggered === "busy" && options.allowDeferredRetry !== false)
+				scheduleDeferredIdleRetry(ctx, busyIdleRetryDelayMs);
+			return triggered === "started";
+		};
 		const branch = safeBranchEntries(ctx);
 		if (!branch) return false;
 		const validatedThroughEntryId = validatedThroughEntryIdFromBranch(
@@ -792,9 +800,7 @@ export function registerLifecycle(
 				validatedThroughEntryId,
 			})
 		) {
-			clearDeferredIdleRetry();
-			triggerPreparedCompaction(ctx, state, config);
-			return true;
+			return triggerIfReady();
 		}
 		if (state.pending && state.status === "ready_to_adopt") {
 			const progress = makeProgressSink(ctx, "auto", state, config);
@@ -831,9 +837,7 @@ export function registerLifecycle(
 						},
 					)
 				) {
-					clearDeferredIdleRetry();
-					triggerPreparedCompaction(ctx, state, config);
-					return true;
+					return triggerIfReady();
 				}
 			}
 		}

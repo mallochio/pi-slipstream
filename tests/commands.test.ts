@@ -633,6 +633,122 @@ describe("commands", () => {
 		assert.match(state.pending?.summary ?? "", /Summary 2/);
 	});
 
+	it("compact --adopt keeps a validated summary pending while Pi is busy", async () => {
+		const state = createRuntimeState({ now: 100 });
+		storePendingValidated(state, {
+			sessionId: "s1",
+			cwd: "/repo",
+			projectId: "/repo",
+			summary: "## Goal\nReady",
+			firstKeptEntryId: "a1",
+			validatedThroughEntryId: "a1",
+			tokensBefore: 100,
+			details: { judge: { score: 9 }, artifacts: [] },
+			expiresAt: 4_000_000_000_000,
+		});
+		let compactCalls = 0;
+
+		const result = await handleSlipstreamCommand(
+			"compact --adopt",
+			state,
+			DEFAULT_CONFIG,
+			{
+				cwd: "/repo",
+				compact: () => {
+					compactCalls += 1;
+				},
+				isIdle: () => true,
+				hasPendingMessages: () => true,
+				sessionManager: {
+					getSessionId: () => "s1",
+					getBranch: () => [
+						{
+							type: "message",
+							id: "a1",
+							parentId: null,
+							timestamp: "t",
+							message: { role: "assistant", content: "ready" },
+						},
+					],
+				},
+			},
+			{ now: () => 150 },
+		);
+
+		assert.equal(result.ok, false);
+		assert.match(result.message, /Pi is busy/);
+		assert.equal(compactCalls, 0);
+		assert.equal(state.status, "ready_to_adopt");
+		assert.equal(state.pending?.summary, "## Goal\nReady");
+	});
+
+	it("one-shot compact prepares but does not apply while Pi has pending messages", async () => {
+		const state = createRuntimeState({ now: 100 });
+		let compactCalls = 0;
+		const result = await handleSlipstreamCommand(
+			"compact",
+			state,
+			{
+				...DEFAULT_CONFIG,
+				maxContinuationTurns: 2,
+				repairAttempts: 0,
+				pendingTtlMs: 10_000,
+				artifactRoot: ".scratch/test-tmp/command-one-shot-busy",
+			},
+			{
+				cwd: process.cwd(),
+				model: { provider: "test", id: "model" },
+				modelRegistry: {
+					find: () => ({ provider: "test", id: "model" }),
+					getApiKeyAndHeaders: async () => ({ apiKey: "test" }),
+				},
+				compact: () => {
+					compactCalls += 1;
+				},
+				isIdle: () => true,
+				hasPendingMessages: () => true,
+				sessionManager: {
+					getSessionId: () => "session-one-shot-busy",
+					getBranch: () => [
+						{
+							type: "message",
+							id: "u1",
+							parentId: null,
+							timestamp: "t",
+							message: { role: "user", content: "Use one-shot compact" },
+						},
+						{
+							type: "message",
+							id: "a1",
+							parentId: null,
+							timestamp: "t",
+							message: { role: "assistant", content: "I continued" },
+						},
+					],
+				},
+				getContextUsage: () => ({ tokens: null, contextWindow: 1_000_000 }),
+			},
+			{
+				createSummaryCompleter: () => async () =>
+					"## Goal\nUse one-shot compact while busy",
+				createJudgeCompleter: () => async () => ({
+					score: 9,
+					decision: "accept",
+					missing: [],
+					contradictions: [],
+					diagnosis: "ok",
+				}),
+				now: () => 100,
+			},
+		);
+
+		assert.equal(result.ok, false);
+		assert.match(result.message, /Pi is busy/);
+		assert.equal(compactCalls, 0);
+		assert.equal(state.status, "ready_to_adopt");
+		assert.match(state.pending?.summary ?? "", /one-shot compact while busy/);
+	});
+
 	it("prepare refuses when continuation evidence is below the configured minimum", async () => {
 		const state = createRuntimeState({ now: 100 });
 		const result = await handleSlipstreamCommand(

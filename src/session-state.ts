@@ -14,7 +14,20 @@ export type CompactCapableContext = {
 		onComplete?: (result: unknown) => void;
 		onError?: (error: Error) => void;
 	}): void;
+	isIdle?: () => boolean;
+	hasPendingMessages?: () => boolean;
 };
+
+export function isCompactRuntimeReady(ctx: CompactCapableContext): boolean {
+	try {
+		if (ctx.isIdle && ctx.isIdle() !== true) return false;
+		if (ctx.hasPendingMessages && ctx.hasPendingMessages() === true)
+			return false;
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 export function createRuntimeState(
 	_options: CreateRuntimeStateOptions = {},
@@ -191,7 +204,7 @@ export function adoptPending(
 	state: RuntimeState,
 	ctx: CompactCapableContext,
 	match: PendingMatch = { now: Date.now() },
-): "slipstream" | null {
+): "slipstream" | "busy" | null {
 	const pending = state.pending;
 	if (!pending || state.status !== "ready_to_adopt") return null;
 	if (match.now > pending.expiresAt) {
@@ -209,6 +222,7 @@ export function adoptPending(
 		state.status = "idle";
 		return null;
 	}
+	if (!isCompactRuntimeReady(ctx)) return "busy";
 	state.status = "summarizing";
 	const request = requestSlipstreamCompaction(state);
 	try {

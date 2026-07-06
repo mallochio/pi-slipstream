@@ -211,6 +211,8 @@ type NotifyContext = ManualAcceptContext & {
 	};
 	sessionManager?: { getBranch(): SessionEntry[]; getSessionId?(): string };
 	getContextUsage?(): ContextUsageSnapshot;
+	isIdle?: () => boolean;
+	hasPendingMessages?: () => boolean;
 	signal?: AbortSignal;
 };
 
@@ -234,6 +236,8 @@ function withRestoredStatusCallbacks(
 	config: SlipstreamConfig,
 ): CompactCapableContext {
 	return {
+		isIdle: ctx.isIdle?.bind(ctx),
+		hasPendingMessages: ctx.hasPendingMessages?.bind(ctx),
 		compact: (options) => {
 			ctx.compact({
 				...options,
@@ -264,6 +268,12 @@ export function handleAdoptCommand(
 	cwd?: string,
 ): CommandResult {
 	const adopted = adoptPending(state, ctx, { now, sessionId, cwd });
+	if (adopted === "busy")
+		return {
+			ok: false,
+			message:
+				"Validated Slipstream summary is ready, but Pi is busy. Run /slipstream compact --adopt again when the parent session is idle.",
+		};
 	if (!adopted)
 		return {
 			ok: false,
