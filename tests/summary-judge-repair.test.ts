@@ -14,6 +14,18 @@ import {
 } from "../src/summary.ts";
 import type { Snapshot } from "../src/types.ts";
 
+const CODEX_COMPACT_PROMPT =
+	"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\n" +
+	"Include:\n" +
+	"- Current progress and key decisions made\n" +
+	"- Important context, constraints, or user preferences\n" +
+	"- What remains to be done (clear next steps)\n" +
+	"- Any critical data, examples, or references needed to continue\n\n" +
+	"Be concise, structured, and focused on helping the next LLM seamlessly continue the work.\n";
+
+const CODEX_SUMMARY_PREFIX =
+	"Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+
 const snapshot: Snapshot = {
 	sessionId: "s1",
 	cwd: "/repo",
@@ -157,10 +169,21 @@ describe("summary, judge, and repair", () => {
 			/Recovery pointer: \/repo\/\.scratch\/compactions\/old-run/,
 		);
 		assert.equal(capsule.split("\n").length <= 32, true);
-		assert.match(summary, /^Continuation card:/);
+		assert.ok(
+			summary.startsWith(
+				`Continuation card:\n${CODEX_SUMMARY_PREFIX}\n\n- Current task:`,
+			),
+		);
+		assert.equal(summary.split(CODEX_SUMMARY_PREFIX).length - 1, 1);
 		assert.match(
 			summary,
 			/## Goal\nContinue safely\n\n---\n\n## Deterministic Evidence Capsule/,
+		);
+		assert.equal(
+			withCurrentStateCapsule(summary, noisySnapshot, [
+				"/repo/.scratch/compactions/run-1/git-diff-full-001.patch",
+			]),
+			summary,
 		);
 
 		const normalized = withCurrentStateCapsule(
@@ -176,10 +199,25 @@ describe("summary, judge, and repair", () => {
 		);
 	});
 
+	it("does not prefix malformed or later continuation-card anchors", () => {
+		for (const prose of [
+			"Continuation card :\n- Current task: malformed anchor",
+			"## Goal\nContinue safely\n\nContinuation card:\n- Current task: later anchor",
+		]) {
+			const summary = withCurrentStateCapsule(prose, snapshot);
+			assert.equal(summary.split(CODEX_SUMMARY_PREFIX).length - 1, 0);
+			assert.ok(summary.startsWith(`${prose}\n\n---\n\n`));
+		}
+	});
+
 	it("builds a grounded summary prompt with protected manifest sections", () => {
 		const prompt = buildSummaryPrompt(snapshot, {
 			artifactRefs: ["artifact://raw"],
 		});
+		assert.equal(
+			prompt.slice(0, CODEX_COMPACT_PROMPT.length),
+			CODEX_COMPACT_PROMPT,
+		);
 		assert.match(prompt, /Revise the previous checkpoint/);
 		assert.match(
 			prompt,

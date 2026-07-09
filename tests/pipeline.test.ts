@@ -8,6 +8,9 @@ import {
 } from "../src/pipeline.ts";
 import type { SessionEntry } from "../src/types.ts";
 
+const CODEX_SUMMARY_PREFIX =
+	"Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+
 function centralStatsPath(root: string, sessionId: string): string {
 	return join(root, "sessions", `${sessionId}.jsonl`);
 }
@@ -461,7 +464,7 @@ describe("pipeline", () => {
 					summaryCalls += 1;
 					return summaryCalls === 1
 						? ""
-						: "## Goal\nContinue Slipstream work.\n\n## Critical Context\nCONFIG_PATH_SENTINEL is preserved.";
+						: "Continuation card:\n- Current task: Continue Slipstream work\n\n## Goal\nContinue Slipstream work.\n\n## Critical Context\nCONFIG_PATH_SENTINEL is preserved.";
 				},
 				completeJudge: async (prompt) => {
 					judgeCalls += 1;
@@ -482,6 +485,7 @@ describe("pipeline", () => {
 			assert.equal(summaryCalls, 2);
 			assert.equal(judgeCalls, 1);
 			assert.match(result.summary, /CONFIG_PATH_SENTINEL/);
+			assert.equal(result.summary.split(CODEX_SUMMARY_PREFIX).length - 1, 1);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -647,8 +651,8 @@ describe("pipeline", () => {
 				continuation: { triggerEntryId: "a5", turns: [] },
 				completeSummary: async (prompt) =>
 					prompt.includes("Rewrite the full summary")
-						? "## Goal\nContinue\n\n## Verification / Evidence\n- reserve gpt-5.5 for manual checkpoints"
-						: "## Goal\nContinue",
+						? "Continuation card:\n- Current task: Continue\n\n## Goal\nContinue\n\n## Verification / Evidence\n- reserve gpt-5.5 for manual checkpoints"
+						: "Continuation card:\n- Current task: Continue\n\n## Goal\nContinue",
 				completeJudge: async (prompt) => {
 					judgeCalls += 1;
 					const summary =
@@ -679,6 +683,7 @@ describe("pipeline", () => {
 			assert.equal(judgeCalls, 2);
 			assert.doesNotMatch(result.summary, /## Slipstream Repair Addendum/);
 			assert.match(result.summary, /reserve gpt-5\.5 for manual checkpoints/);
+			assert.equal(result.summary.split(CODEX_SUMMARY_PREFIX).length - 1, 1);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

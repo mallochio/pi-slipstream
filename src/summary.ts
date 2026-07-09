@@ -12,6 +12,29 @@ export type SummaryPromptOptions = {
 
 export const DEFAULT_MAX_SUMMARY_PROMPT_CHARS = 650_000;
 
+const CODEX_COMPACT_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
+
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.
+`;
+
+const CONTINUATION_CARD_HEADING = "Continuation card:";
+const CODEX_SUMMARY_PREFIX =
+	"Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+
+function insertCodexSummaryPrefix(summary: string): string {
+	const anchoredPrefix = `${CONTINUATION_CARD_HEADING}\n${CODEX_SUMMARY_PREFIX}`;
+	if (!summary.startsWith(`${CONTINUATION_CARD_HEADING}\n`)) return summary;
+	if (summary === anchoredPrefix || summary.startsWith(`${anchoredPrefix}\n`))
+		return summary;
+	return `${anchoredPrefix}\n\n${summary.slice(CONTINUATION_CARD_HEADING.length + 1)}`;
+}
+
 function list(lines: string[]): string {
 	return lines.length ? lines.map((line) => `- ${line}`).join("\n") : "- None";
 }
@@ -194,7 +217,7 @@ export function withCurrentStateCapsule(
 			.join("\n\n---\n\n")
 			.trim();
 	}
-	return `${prose}\n\n---\n\n${buildCurrentStateCapsule(snapshot, artifactRefs)}`;
+	return `${insertCodexSummaryPrefix(prose)}\n\n---\n\n${buildCurrentStateCapsule(snapshot, artifactRefs)}`;
 }
 
 function renderStateEvidence(
@@ -337,7 +360,7 @@ function renderSummaryPrompt(
 	conversation: string,
 ): string {
 	const manifest = snapshot.manifest;
-	return `You are a Slipstream-style compaction writer for a coding agent.
+	return `${CODEX_COMPACT_PROMPT}You are a Slipstream-style compaction writer for a coding agent.
 
 Write the continuation handoff that a strong next agent would want before taking the next tool call. The summary itself must start with the Continuation card as the first line; if your draft starts with ## Goal or any deterministic capsule, rewrite it before returning. Keep the model-facing handoff under roughly 100-150 lines unless extra length is required for safety. Only the Continuation card and narrative sections are authoritative current state. The deterministic capsule is raw/historical evidence appended later for recovery. Optimize for continuation utility, not keyword recall, prettiness, or archival completeness. The best summary is a dense, source-grounded runbook: current objective, actual latest state, constraints, verification, risks, exact next actions, and enough concrete paths/commands/entities to avoid re-discovery.
 
