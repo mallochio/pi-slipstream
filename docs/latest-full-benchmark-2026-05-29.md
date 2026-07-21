@@ -1,6 +1,6 @@
 # Benchmark report — 2026-05-29
 
-This report summarizes the latest validation results for `pi-slipstream-compact` before the `0.1.0` release.
+This report summarizes the latest validation results for `pi-slipstream` before the `0.1.0` release.
 
 The benchmark asks one practical question: after a long coding session is compacted, does the resulting handoff preserve enough current state for a fresh agent to continue without stale next actions, missing files, or lost decisions?
 
@@ -31,7 +31,7 @@ These results are not SWE-bench task scores. SWE-bench-derived trajectories were
 
 | Method                 | Meaning                                           |
 | ---------------------- | ------------------------------------------------- |
-| Slipstream             | `pi-slipstream-compact` reviewed compaction path. |
+| Slipstream             | `pi-slipstream` reviewed compaction path. |
 | Native `/compact`      | Pi's native compaction behavior.                  |
 | Benchmark Codex prompt | A benchmark-only Codex-style prompt baseline.     |
 

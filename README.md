@@ -1,4 +1,4 @@
-# pi-slipstream-compact
+# pi-slipstream
 
 Safer compaction for long [Pi Coding Agent](https://github.com/badlogic/pi-mono) sessions.
 
@@ -21,13 +21,13 @@ Install it, then keep using Pi normally.
 ## Install
 
 ```bash
-pi install npm:pi-slipstream-compact
+pi install npm:pi-slipstream
 ```
 
 Or install from GitHub:
 
 ```bash
-pi install git:github.com/OrestesK/pi-slipstream-compact@v0.1.0
+pi install git:github.com/mallochio/pi-slipstream@v0.1.0
 ```
 
 Pi packages run with full local permissions. Review source before installing packages from npm, git, or another machine.
@@ -55,7 +55,7 @@ Default config is intentionally small:
 
 ```json
 {
-	"pi-slipstream-compact": {
+	"pi-slipstream": {
 		"enabled": true,
 		"autoTrigger": true,
 		"artifactRoot": ".scratch/compactions"
@@ -71,6 +71,7 @@ Important defaults:
 | `autoTrigger`           |                 `true` | Starts preparing a checked summary in the background when the session gets large.                 |
 | `replaceDefaultCompact` |                 `true` | Makes plain `/compact` use Slipstream by default; set `false` for side-by-side mode.              |
 | `triggerContextPercent` |                  `0.6` | Starts/latches auto compaction around 60% context usage.                                          |
+| `triggerContextTokens`  |            `undefined` | Optional absolute token threshold that overrides `triggerContextPercent`.                         |
 | `judgeThreshold`        |                    `7` | Minimum continuation-quality score before normal acceptance.                                      |
 | `repairAttempts`        |                    `3` | Tries full-summary repair after judge rejection.                                                  |
 | `rejectedSummaryMode`   |                `"ask"` | Shows an interactive decision when possible; accepts on timeout/no UI unless explicitly rejected. |
@@ -113,7 +114,7 @@ Prepared summaries expire after `pendingTtlMs` (default: 5 minutes) and are reje
 
 ## Native compact vs Slipstream
 
-| Area                   | Native `/compact`                                            | `pi-slipstream-compact`                                                                              |
+| Area                   | Native `/compact`                                            | `pi-slipstream`                                                                              |
 | ---------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
 | Main path              | One summarization pass.                                      | Generate, validate, repair if needed, then adopt.                                                    |
 | Current-state fidelity | Can lose exact latest files, errors, or decisions.           | Prepends deterministic current-state facts and validates them before adoption.                       |
@@ -220,7 +221,7 @@ The important difference from a normal summarizer: adoption is validated and sco
 From this repository:
 
 ```bash
-cd packages/pi-slipstream-compact
+cd packages/pi-slipstream
 pi -e .
 ```
 
@@ -228,14 +229,14 @@ Or add the local package path to Pi settings:
 
 ```json
 {
-	"packages": ["/absolute/path/to/pi-slipstream-compact"]
+	"packages": ["/absolute/path/to/pi-slipstream"]
 }
 ```
 
 You can also persist the local package with Pi's installer:
 
 ```bash
-pi install /absolute/path/to/pi-slipstream-compact
+pi install /absolute/path/to/pi-slipstream
 ```
 
 ## Support commands
@@ -270,13 +271,13 @@ Local rollout:
 
 ## Full configuration
 
-Configure in `~/.pi/agent/settings.json` or project `.pi/settings.json`. The canonical settings key is `"pi-slipstream-compact"`; the older `"slipstreamCompact"` key is also accepted for compatibility.
+Configure in `~/.pi/agent/settings.json` or project `.pi/settings.json`. The canonical settings key is `"pi-slipstream"`; the older `"pi-slipstream-compact"` and `"slipstreamCompact"` keys are also accepted for compatibility.
 
 Default-style configuration:
 
 ```json
 {
-	"pi-slipstream-compact": {
+	"pi-slipstream": {
 		"enabled": true,
 		"autoTrigger": true,
 		"artifactRoot": ".scratch/compactions"
@@ -288,7 +289,7 @@ Disable background preparation:
 
 ```json
 {
-	"pi-slipstream-compact": {
+	"pi-slipstream": {
 		"autoTrigger": false
 	}
 }
@@ -300,7 +301,7 @@ Run side-by-side with native Pi or another extension owning plain `/compact`:
 
 ```json
 {
-	"pi-slipstream-compact": {
+	"pi-slipstream": {
 		"replaceDefaultCompact": false
 	}
 }
@@ -312,7 +313,7 @@ Disable Slipstream compaction replacement entirely:
 
 ```json
 {
-	"pi-slipstream-compact": {
+	"pi-slipstream": {
 		"enabled": false
 	}
 }
@@ -324,7 +325,7 @@ Tuned local configuration example:
 
 ```json
 {
-	"pi-slipstream-compact": {
+	"pi-slipstream": {
 		"enabled": true,
 		"autoTrigger": true,
 		"triggerContextPercent": 0.6,
@@ -346,6 +347,7 @@ Tuned local configuration example:
 | `autoTrigger`           |                 `true` | Starts background summary preparation near context pressure. Set `false` to disable background preparation. Forced off when `replaceDefaultCompact` is `false`, including when explicitly configured as `true`.                                                                                                                                |
 | `replaceDefaultCompact` |                 `true` | When `true`, plain Pi `/compact` and threshold compaction use Slipstream. When `false`, plain/default compaction is left to Pi or another extension, while explicit `/slipstream compact` and `--adopt` still use Slipstream.                                                                                                                  |
 | `triggerContextPercent` |                  `0.6` | Single context-pressure threshold for starting background preparation and latching compaction urgency. Fresh validated summaries compact when Pi reports the session is idle; stale summaries are revalidated before adoption. Legacy `softContextPercent`/`hardContextPercent` are accepted as aliases but should not be used for new config. |
+| `triggerContextTokens`  |            `undefined` | Absolute token threshold for compaction urgency. When configured, this explicitly overrides `triggerContextPercent` logic regardless of the active model's max context size. |
 | `minContinuationTurns`  |                    `1` | Preferred continuation turns before turn-boundary auto validation. If Pi is already idle after the background summary resolves, auto finalization may proceed with fewer turns instead of waiting forever.                                                                                                                                     |
 | `maxContinuationTurns`  |                    `4` | Maximum continuation turns collected for auto validation when later turns arrive.                                                                                                                                                                                                                                                              |
 | `judgeThreshold`        |                    `7` | Minimum accepted strict continuation-quality judge score. The judge prompt itself rejects safe-but-weak summaries for repair unless they are production-ready durable handoffs.                                                                                                                                                                |
@@ -363,7 +365,7 @@ Optional model override example:
 
 ```json
 {
-	"pi-slipstream-compact": {
+	"pi-slipstream": {
 		"summaryModel": "openai/gpt-4.1",
 		"judgeModel": "openai/gpt-4.1"
 	}
@@ -388,7 +390,7 @@ The normal manual path is plain Pi `/compact` or `/slipstream compact` when `rep
 Other extensions can reuse Slipstream-style validation without installing Slipstream as the default `/compact` owner:
 
 ```ts
-import { slipstreamStyleValidateAndRepair } from "pi-slipstream-compact/integration-api";
+import { slipstreamStyleValidateAndRepair } from "pi-slipstream/integration-api";
 
 const result = await slipstreamStyleValidateAndRepair({
 	candidate,
@@ -511,7 +513,7 @@ Raw git diff text alone is not acceptance-blocking. If a patch detail matters fo
 Current local verification:
 
 ```bash
-(cd packages/pi-slipstream-compact && npm run check)
+(cd packages/pi-slipstream && npm run check)
 ```
 
 Latest result:
@@ -604,7 +606,7 @@ Slipstream also sends compacted session evidence to the configured model provide
 ## Development
 
 ```bash
-cd packages/pi-slipstream-compact
+cd packages/pi-slipstream
 npm test
 npm run typecheck
 npm run check
@@ -621,7 +623,7 @@ npm version patch --no-git-tag-version
 # review package.json/package-lock.json, commit, then tag the commit as vX.Y.Z
 ```
 
-One-time npm setup: configure npm trusted publishing for `OrestesK/pi-slipstream-compact` with provider `GitHub Actions` and workflow filename `publish.yml`. The workflow uses OIDC (`id-token: write`) and does not require an `NPM_TOKEN` secret.
+One-time npm setup: configure npm trusted publishing for `mallochio/pi-slipstream` with provider `GitHub Actions` and workflow filename `publish.yml`. The workflow uses OIDC (`id-token: write`) and does not require an `NPM_TOKEN` secret.
 
 Package layout:
 
@@ -652,4 +654,4 @@ src/
 
 ## Bottom line
 
-`pi-slipstream-compact` is built around one principle: **do not trust a compaction summary until it proves it can support what the agent needs next**.
+`pi-slipstream` is built around one principle: **do not trust a compaction summary until it proves it can support what the agent needs next**.
