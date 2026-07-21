@@ -28,6 +28,7 @@ export type SlipstreamConfig = {
 };
 
 export const CONFIG_KEYS = [
+	"pi-slipstream",
 	"pi-slipstream-compact",
 	"slipstreamCompact",
 ] as const;

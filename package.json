@@ -1,5 +1,5 @@
 {
-  "name": "pi-slipstream-compact",
+  "name": "pi-slipstream",
   "version": "0.1.7",
   "description": "Slipstream-style validated compaction extension for Pi Coding Agent",
   "type": "module",
@@ -7,12 +7,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/OrestesK/pi-slipstream-compact.git"
+    "url": "git+https://github.com/mallochio/pi-slipstream.git"
   },
   "bugs": {
-    "url": "https://github.com/OrestesK/pi-slipstream-compact/issues"
+    "url": "https://github.com/mallochio/pi-slipstream/issues"
   },
-  "homepage": "https://github.com/OrestesK/pi-slipstream-compact#readme",
+  "homepage": "https://github.com/mallochio/pi-slipstream#readme",
   "exports": {
     ".": "./src/index.ts",
     "./integration-api": "./src/integration-api.ts",
