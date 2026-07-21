@@ -10,6 +10,7 @@ export type SlipstreamConfig = {
 	autoTrigger: boolean;
 	replaceDefaultCompact: boolean;
 	triggerContextPercent: number;
+	triggerContextTokens?: number;
 	softContextPercent: number;
 	hardContextPercent: number;
 	contextReserveTokens: number;
@@ -224,6 +225,7 @@ export function normalizeConfig(raw: unknown = {}): SlipstreamConfig {
 				DEFAULT_CONFIG.triggerContextPercent,
 			),
 		),
+		triggerContextTokens: typeof raw.triggerContextTokens === "number" && Number.isFinite(raw.triggerContextTokens) ? raw.triggerContextTokens : undefined,
 		softContextPercent: optionalNumber(
 			raw,
 			"softContextPercent",

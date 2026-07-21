@@ -147,9 +147,13 @@ export function shouldStartAutoJob(
 ): boolean {
 	if (!config.enabled || !config.autoTrigger) return false;
 	clearMismatchedPending(state, match);
-	const percent = contextPercent(usage, config);
-	if (typeof percent === "number" && percent >= config.triggerContextPercent)
-		state.compactionWanted = true;
+	if (typeof config.triggerContextTokens === "number" && typeof usage?.tokens === "number") {
+		if (usage.tokens >= config.triggerContextTokens) state.compactionWanted = true;
+	} else {
+		const percent = contextPercent(usage, config);
+		if (typeof percent === "number" && percent >= config.triggerContextPercent)
+			state.compactionWanted = true;
+	}
 	if (state.pending || state.autoJob || state.activePromise) return false;
 	return state.compactionWanted;
 }
